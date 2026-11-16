@@ -72,58 +72,13 @@ func (s *Store) validateEncoding(enc mempher.Encoding) error {
 	return nil
 }
 
-// pendingEncodingsSQL finds episodes with no encoding for a model. The anti-join
-// runs against L0 and the encodings table alone, which is what makes the queue
-// rebuildable: enqueue what this returns and any episode missed by a lost job, or
-// left behind by a change of model, gets encoded.
-const (
-	pendingAllScopesSQL = `
-SELECT e.id
-FROM mempher.episodes e
-WHERE NOT EXISTS (
-    SELECT 1 FROM mempher.episode_encodings x
-    WHERE x.episode_id = e.id AND x.model = $1
-)
-ORDER BY e.scope_id, e.seq
-LIMIT $2`
-
-	pendingOneScopeSQL = `
-SELECT e.id
-FROM mempher.episodes e
-WHERE e.scope_id = $1
-  AND e.seq > $2
-  AND NOT EXISTS (
-    SELECT 1 FROM mempher.episode_encodings x
-    WHERE x.episode_id = e.id AND x.model = $3
-)
-ORDER BY e.seq
-LIMIT $4`
-)
-
 // PendingEncodings returns ids of episodes with no encoding for a model, in Seq
 // order.
 func (s *Store) PendingEncodings(
 	ctx context.Context,
 	q ops.PendingEncodings,
 ) ([]mempher.EpisodeID, error) {
-	if q.Model == "" {
-		return nil, fmt.Errorf("mempher/postgres: pending encodings: model is empty: %w",
-			mempher.ErrInvalidConfig)
-	}
-	if q.Scope != "" {
-		if err := q.Scope.Validate(); err != nil {
-			return nil, fmt.Errorf("mempher/postgres: pending encodings: %w", err)
-		}
-	}
-	switch {
-	case q.AfterSeq < 0:
-		return nil, fmt.Errorf("mempher/postgres: pending encodings: AfterSeq is %d: %w",
-			q.AfterSeq, mempher.ErrInvalidConfig)
-	case q.AfterSeq > 0 && q.Scope == "":
-		return nil, fmt.Errorf(
-			"mempher/postgres: pending encodings: AfterSeq needs a Scope, because seq is only "+
-				"ordered within one: %w", mempher.ErrInvalidConfig)
-	case q.Limit < 0:
+	if q.Limit < 0 {
 		return nil, fmt.Errorf("mempher/postgres: pending encodings: Limit is %d: %w",
 			q.Limit, mempher.ErrInvalidConfig)
 	}
@@ -131,24 +86,18 @@ func (s *Store) PendingEncodings(
 	if limit == 0 {
 		limit = DefaultPendingEncodingsLimit
 	}
-
-	// Two statements rather than one with an OR, so each can use its index.
-	sql, args := pendingAllScopesSQL, []any{string(q.Model), limit}
+	var scope *string
 	if q.Scope != "" {
-		sql = pendingOneScopeSQL
-		args = []any{string(q.Scope), q.AfterSeq, string(q.Model), limit}
+		name := string(q.Scope)
+		scope = &name
 	}
-
-	rows, err := s.pool.Query(ctx, sql, args...)
+	rows, err := s.pool.Query(ctx,
+		`SELECT id FROM mempher.pending_episodes('encode', $1, $2, $3, $4)`,
+		string(q.Model), scope, q.AfterSeq, int32(limit))
 	if err != nil {
-		if isCode(err, pgerrcodeUndefinedTable, pgerrcodeInvalidSchema) {
-			return nil, fmt.Errorf("mempher/postgres: pending encodings: run Migrate first: %w",
-				ErrSchemaNotReady)
-		}
-		return nil, fmt.Errorf("mempher/postgres: pending encodings for model %q: %w", q.Model, err)
+		return nil, apiError("pending encodings", err)
 	}
 	defer rows.Close()
-
 	out := make([]mempher.EpisodeID, 0, min(limit, 128))
 	for rows.Next() {
 		var id uuid.UUID
@@ -158,7 +107,7 @@ func (s *Store) PendingEncodings(
 		out = append(out, mempher.EpisodeID(id))
 	}
 	if err := rows.Err(); err != nil {
-		return nil, fmt.Errorf("mempher/postgres: pending encodings for model %q: %w", q.Model, err)
+		return nil, apiError("pending encodings", err)
 	}
 	return out, nil
 }
