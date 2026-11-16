@@ -50,7 +50,7 @@ ex, err := extract.New(completer, extract.Options{
 	Instructions: "A support agent: care about entitlements and past incidents.",
 })
 
-fmt.Println(ex.Model()) // mempher-extract/v2+claude-opus-5+a3f9c1e2
+fmt.Println(ex.Model()) // mempher-extract/v3+claude-opus-5+a3f9c1e2
 ```
 
 Any other provider is one method, `Complete(ctx, extract.Prompt) ([]byte, error)`,
@@ -63,6 +63,7 @@ plus `Model() string`.
 | `Predicates` | a closed vocabulary of relations, sent to the provider as an enum. Without it a model writes `lives_in` one day and `resides_in` the next, and nothing supersedes anything. |
 | `Instructions` | what this deployment considers worth remembering, appended to the shipped prompt |
 | `MaxAssertions` | how many facts one extraction may assert |
+| `MinAliasConfidence` | how sure the model must be for an alias it declares to be kept; 0.9 by default |
 | `Reconcile` | a first, cheap call that picks which known facts the extraction is shown |
 
 ### What an extraction returns

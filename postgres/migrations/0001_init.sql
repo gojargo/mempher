@@ -1578,6 +1578,14 @@ END $$;
 -- merged into p_of's: its names move, its facts are rewritten to the surviving
 -- subject, and its row goes.
 --
+-- With p_merge false, which is how an extraction declares an alias, two
+-- entities that both have facts are never merged: the alias is ignored. A model
+-- that takes two people for one is a mistake that cannot be undone, and joining
+-- two bodies of facts on a model's word is where it would do the damage. When
+-- only one of the two has facts, that one stands, whichever side of the alias
+-- it was on, so nothing is rewritten. Merging two entities that both have
+-- facts is merge_entities' job, and a person's decision.
+--
 -- Rewriting can put two rows on one claim over overlapping windows, which the
 -- temporal key forbids and which is exactly the duplicate the merge exists to
 -- remove. The surviving entity's row stands as it is and gains the other's
@@ -1585,7 +1593,8 @@ END $$;
 -- right is not something a merge can know, so it does not combine them: the
 -- side named as the real one is believed.
 CREATE FUNCTION mempher._alias_entity(
-    p_scope text, p_extractor text, p_alias text, p_of text, p_at timestamptz, p_episodes uuid[])
+    p_scope text, p_extractor text, p_alias text, p_of text, p_at timestamptz, p_episodes uuid[],
+    p_merge boolean DEFAULT true)
     RETURNS uuid
     LANGUAGE plpgsql
     SET search_path FROM CURRENT
@@ -1596,6 +1605,7 @@ DECLARE
     v_from      uuid;
     v_into_name text;
     v_from_name text;
+    v_swap      uuid;
 BEGIN
     SELECT a.entity_id INTO v_from FROM mempher.entity_aliases a
     WHERE a.scope_id = p_scope AND a.extractor = p_extractor AND a.key = v_key;
@@ -1610,6 +1620,24 @@ BEGIN
 
     SELECT e.name INTO v_into_name FROM mempher.entities e WHERE e.id = v_into;
     SELECT e.name INTO v_from_name FROM mempher.entities e WHERE e.id = v_from;
+
+    IF NOT p_merge AND EXISTS (
+        SELECT 1 FROM mempher.facts f
+        WHERE f.scope_id = p_scope AND f.extractor = p_extractor AND f.subject = v_from_name
+    ) THEN
+        IF EXISTS (
+            SELECT 1 FROM mempher.facts f
+            WHERE f.scope_id = p_scope AND f.extractor = p_extractor AND f.subject = v_into_name
+        ) THEN
+            RETURN v_into;
+        END IF;
+        -- Only the alias's entity has facts, so it is the one that stands.
+        v_swap := v_into;
+        v_into := v_from;
+        v_from := v_swap;
+        v_from_name := v_into_name;
+        SELECT e.name INTO v_into_name FROM mempher.entities e WHERE e.id = v_into;
+    END IF;
 
     WITH clash AS (
         SELECT kept.id AS kept, gone.id AS gone, gone.episode_ids
@@ -1879,7 +1907,7 @@ BEGIN
         FOR v_elem IN SELECT e FROM jsonb_array_elements(p_aliases) AS a(e)
         LOOP
             PERFORM mempher._alias_entity(p_scope, p_extractor,
-                v_elem->>'alias', v_elem->>'of', p_at, p_episodes);
+                v_elem->>'alias', v_elem->>'of', p_at, p_episodes, false);
         END LOOP;
 
         -- Every subject is an entity, created under the first spelling it is
@@ -1893,9 +1921,15 @@ BEGIN
         END LOOP;
 
         -- A claim already held over exactly this window gains this
-        -- extraction's episodes as provenance and its latest wording; any
-        -- other claim is a new row. A new row that overlaps a window the
-        -- scope already believes is the conflict WITHOUT OVERLAPS exists to
+        -- extraction's episodes as provenance and its latest wording. A claim
+        -- already held over a window that overlaps this one without matching
+        -- it is a restatement dated differently: the window the scope
+        -- believes stands, because nothing here can say which of the two is
+        -- right, and the fact gains the episodes as provenance. Refusing the
+        -- whole extraction over it, as this once did, cost a job its good
+        -- claims on every retry until it died. Any other claim is a new row.
+        -- Two new rows that overlap each other, which two names of one entity
+        -- can still produce, are the conflict WITHOUT OVERLAPS exists to
         -- catch. Each is written under its entity's name, whichever of the
         -- entity's names the assertion used, which is what makes the same
         -- claim about "Anna" and about "the user's sister" one row.
@@ -1921,6 +1955,14 @@ BEGIN
                   AND (f.subject, f.predicate, f.object) = (a.subject, a.predicate, a.object)
                   AND f.valid = a.valid
                 RETURNING a.ord
+            ), restated AS (
+                UPDATE mempher.facts f
+                SET episode_ids = (SELECT array_agg(DISTINCT e ORDER BY e) FROM unnest(f.episode_ids || p_episodes) AS e),
+                    updated_at  = p_at
+                WHERE f.scope_id = p_scope AND f.extractor = p_extractor
+                  AND EXISTS (SELECT 1 FROM a
+                              WHERE (f.subject, f.predicate, f.object) = (a.subject, a.predicate, a.object)
+                                AND f.valid && a.valid AND f.valid <> a.valid)
             )
             INSERT INTO mempher.facts
                 (scope_id, extractor, subject, predicate, object, statement, valid,
@@ -1928,11 +1970,17 @@ BEGIN
             SELECT p_scope, p_extractor, a.subject, a.predicate, a.object, a.statement, a.valid,
                    a.confidence, p_episodes, p_at, p_at
             FROM a
-            WHERE a.ord NOT IN (SELECT u.ord FROM updated u);
+            -- Reads the facts as they stood before this statement, so it
+            -- leaves out exactly the claims the two updates above took.
+            WHERE NOT EXISTS (
+                SELECT 1 FROM mempher.facts f
+                WHERE f.scope_id = p_scope AND f.extractor = p_extractor
+                  AND (f.subject, f.predicate, f.object) = (a.subject, a.predicate, a.object)
+                  AND f.valid && a.valid);
         EXCEPTION WHEN exclusion_violation THEN
             PERFORM mempher._fail('MP022',
-                'an assertion overlaps a window the scope already believes for the same claim',
-                'retract the existing fact first, or assert the window it does not cover');
+                'two assertions hold the same claim over overlapping windows',
+                'they name one entity by two of its names; assert the claim once');
         END;
     END IF;
 
@@ -1962,11 +2010,13 @@ END $$;
 COMMENT ON FUNCTION mempher.apply_extraction(text, text, uuid[], jsonb, jsonb, timestamptz, boolean, jsonb) IS
     'Records one extraction of some episodes atomically: their read markers, the '
     'retractions (each {"fact": uuid, "at": timestamp} closes that fact''s window), the '
-    'aliases (each {"alias": name, "of": name} declares two names for one entity, as '
-    'merge_entities does), and the assertions (each {"subject", "predicate", "object", '
+    'aliases (each {"alias": name, "of": name} declares two names for one entity; unlike '
+    'merge_entities, an alias that would join two entities that both have facts is '
+    'ignored), and the assertions (each {"subject", "predicate", "object", '
     '"statement", "valid_from", "valid_to"?, "confidence"?}). Every subject becomes an '
     'entity, and a fact is stored under its entity''s name whichever of its names the '
-    'assertion used. Applying the same extraction twice changes nothing the '
+    'assertion used. An assertion of a claim already held over an overlapping window '
+    'leaves that window as it is and adds the episodes to its provenance. Applying the same extraction twice changes nothing the '
     'second time. Returns every fact the extraction''s episodes support, and, unless '
     'p_encode is false, queues an encode_facts job when one of them has no vector.';
 

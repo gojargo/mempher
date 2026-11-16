@@ -88,7 +88,7 @@ func Example() {
 	}
 
 	// Output:
-	// mempher-extract/v2+example-model+daa9c0a4
+	// mempher-extract/v3+example-model+2b805130
 	// assert   the user lives_in "Berlin"  since 2024-06-01
 	// retract  0190b1c2-1111-7000-8000-000000000001  at 2024-06-01
 }

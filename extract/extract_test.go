@@ -142,7 +142,7 @@ func TestNewRejectsUnusableConfig(t *testing.T) {
 func TestModelIdentifiesWhatProducedTheFacts(t *testing.T) {
 	base := newExtractor(t, newFake(), Options{})
 
-	if got := string(base.Model()); !strings.HasPrefix(got, "mempher-extract/v2+test-model+") {
+	if got := string(base.Model()); !strings.HasPrefix(got, "mempher-extract/v3+test-model+") {
 		t.Fatalf("Model = %q, want the prompt revision and the provider model in it", got)
 	}
 	if len(base.Model()) > mempher.MaxExtractorLen {
@@ -537,8 +537,8 @@ func TestPromptRevisionIsPinnedToTheTextItShips(t *testing.T) {
 	// revision then stay the old revision's until ops.Backfill re-derives them,
 	// which is the intended cost and the whole reason the revision is in the id.
 	const (
-		pinnedRevision = 2
-		pinnedDigest   = "a493b370573ceac7"
+		pinnedRevision = 3
+		pinnedDigest   = "f1594b458826855e"
 	)
 
 	schema, err := extractionSchema(Options{MaxAssertions: DefaultMaxAssertions})
@@ -630,9 +630,11 @@ func TestExtractReadsAliasesAndShowsTheKnownNames(t *testing.T) {
 		"assertions": [],
 		"retractions": [],
 		"aliases": [
-			{"alias": " Anna ", "of": "the user's sister"},
-			{"alias": "the user", "of": "The User"},
-			{"alias": "", "of": "the user"}
+			{"alias": " Anna ", "of": "the user's sister", "confidence": 1},
+			{"alias": "the user", "of": "The User", "confidence": 1},
+			{"alias": "", "of": "the user", "confidence": 1},
+			{"alias": "Deb", "of": "the user's sister", "confidence": 0.6},
+			{"alias": "Jo", "of": "the user's sister"}
 		]
 	}`)
 	e := newExtractor(t, c, Options{})
@@ -648,7 +650,7 @@ func TestExtractReadsAliasesAndShowsTheKnownNames(t *testing.T) {
 	}
 	want := []mempher.Alias{{Name: "Anna", Of: "the user's sister"}}
 	if !slices.Equal(res.Alias, want) {
-		t.Errorf("aliases = %+v, want %+v: a name for itself and an empty name are dropped", res.Alias, want)
+		t.Errorf("aliases = %+v, want %+v: a name for itself, an empty name and an unsure alias are dropped", res.Alias, want)
 	}
 
 	user := c.prompts[0].User
@@ -668,5 +670,61 @@ func TestAReplyWithoutAliasesIsStillAnAnswer(t *testing.T) {
 	}
 	if len(res.Alias) != 0 {
 		t.Errorf("aliases = %+v, want none", res.Alias)
+	}
+}
+
+func TestExtractDropsARestatedKnownFactRatherThanConflicting(t *testing.T) {
+	// Paris is known since 2019. Asserting it again from another date would be
+	// refused by the store as a conflict and fail the whole extraction, so the
+	// restatement is dropped and the new claim beside it survives. The same
+	// holds when the subject is given by another of its names.
+	c := newFake(`{
+		"assertions": [
+			{"subject": "Alice", "predicate": "lives_in", "object": "Paris",
+			 "statement": "Alice lives in Paris", "valid_from": "2024-06-01", "confidence": 1},
+			{"subject": "the user", "predicate": "likes", "object": "tea",
+			 "statement": "the user likes tea", "valid_from": "2024-06-01", "confidence": 1}
+		],
+		"retractions": []
+	}`)
+	e := newExtractor(t, c, Options{})
+
+	req := request(parisFact())
+	req.Entities = []mempher.Entity{{Name: "the user", Aliases: []mempher.Subject{"Alice"}}}
+	res, err := e.Extract(t.Context(), req)
+	if err != nil {
+		t.Fatalf("Extract: %v", err)
+	}
+	if len(res.Assert) != 1 || res.Assert[0].Object != "tea" {
+		t.Fatalf("assertions = %+v, want only the new claim", res.Assert)
+	}
+}
+
+func TestExtractKeepsTheFirstOfTwoWindowsForOneClaim(t *testing.T) {
+	// One answer giving a claim two overlapping windows would be refused whole
+	// by the store. The first window stands, and an exact repeat is left for
+	// the store, which treats it as one claim.
+	c := newFake(`{
+		"assertions": [
+			{"subject": "Evan", "predicate": "has_hobby", "object": "skiing",
+			 "statement": "Evan skis", "valid_from": "2024-01-01", "confidence": 1},
+			{"subject": "evan", "predicate": "has_hobby", "object": "skiing",
+			 "statement": "Evan skis", "valid_from": "2024-03-01", "confidence": 1},
+			{"subject": "Evan", "predicate": "has_hobby", "object": "skiing",
+			 "statement": "Evan skis", "valid_from": "2024-01-01", "confidence": 1}
+		],
+		"retractions": []
+	}`)
+	res, err := newExtractor(t, c, Options{}).Extract(t.Context(), request())
+	if err != nil {
+		t.Fatalf("Extract: %v", err)
+	}
+	if len(res.Assert) != 2 {
+		t.Fatalf("got %d assertions, want the first and its exact repeat", len(res.Assert))
+	}
+	for _, a := range res.Assert {
+		if a.Valid.From.Month() != time.January {
+			t.Errorf("kept the window from %s, want the first one given", a.Valid.From)
+		}
 	}
 }

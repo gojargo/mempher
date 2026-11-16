@@ -1053,3 +1053,74 @@ func TestSQLEntities(t *testing.T) {
 			`SELECT mempher.search_facts('e:bad', 'x/v1', p_weights := '{"entities": 1}')`), "MP013")
 	})
 }
+
+func TestSQLExtractionAliasesAreCautious(t *testing.T) {
+	t.Parallel()
+	_, pool := migrated(t)
+	ctx := t.Context()
+
+	apply := func(scope, subject, object, aliases string) {
+		t.Helper()
+		var episode string
+		if err := pool.QueryRow(ctx, `
+			SELECT id::text FROM mempher.append($1, '[{"content":"c","role":"user","source":"s"}]',
+			                                    '2026-01-01T00:00:00Z')`, scope).Scan(&episode); err != nil {
+			t.Fatalf("append: %v", err)
+		}
+		assert := `[]`
+		if subject != "" {
+			assert = `[{"subject":"` + subject + `","predicate":"likes","object":"` + object +
+				`","statement":"s","valid_from":"2026-01-01"}]`
+		}
+		if err := exec(t, pool, `
+			SELECT count(*) FROM mempher.apply_extraction($1, 'x/v1', ARRAY[$2::uuid], $3::jsonb, '[]',
+			                                              '2026-01-02', p_aliases := $4::jsonb)`,
+			scope, episode, assert, aliases); err != nil {
+			t.Fatalf("apply: %v", err)
+		}
+	}
+	entities := func(scope string) []string {
+		t.Helper()
+		rows, err := pool.Query(ctx, `
+			SELECT name || '=' || array_to_string(aliases, ',') || ':' || facts
+			FROM mempher.list_entities($1, 'x/v1')`, scope)
+		if err != nil {
+			t.Fatalf("list_entities: %v", err)
+		}
+		defer rows.Close()
+		var out []string
+		for rows.Next() {
+			var s string
+			if err := rows.Scan(&s); err != nil {
+				t.Fatalf("scan: %v", err)
+			}
+			out = append(out, s)
+		}
+		slices.Sort(out)
+		return out
+	}
+
+	t.Run("an alias does not join two entities that both have facts", func(t *testing.T) {
+		apply("c:both", "Deborah", "tea", `[]`)
+		apply("c:both", "Jolene", "jazz", `[]`)
+		apply("c:both", "", "", `[{"alias":"Jolene","of":"Deborah"}]`)
+		if got, want := entities("c:both"), []string{"Deborah=:1", "Jolene=:1"}; !slices.Equal(got, want) {
+			t.Errorf("entities = %q, want %q", got, want)
+		}
+		// A person deciding it is another matter.
+		if err := exec(t, pool, `SELECT mempher.merge_entities('c:both', 'x/v1', 'Jolene', 'Deborah')`); err != nil {
+			t.Fatalf("merge_entities: %v", err)
+		}
+		if got, want := entities("c:both"), []string{"Deborah=Jolene:2"}; !slices.Equal(got, want) {
+			t.Errorf("after merge_entities = %q, want %q", got, want)
+		}
+	})
+
+	t.Run("when only one side has facts, that entity stands", func(t *testing.T) {
+		apply("c:one", "Anna", "tea", `[]`)
+		apply("c:one", "", "", `[{"alias":"Anna","of":"the user's sister"}]`)
+		if got, want := entities("c:one"), []string{"Anna=the user's sister:1"}; !slices.Equal(got, want) {
+			t.Errorf("entities = %q, want %q", got, want)
+		}
+	})
+}

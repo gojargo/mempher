@@ -123,8 +123,15 @@ func extractionSchema(opts Options) (json.RawMessage, error) {
 	alias := &jsonSchema{
 		Type:                 "object",
 		AdditionalProperties: ptr(false),
-		Required:             []string{"alias", "of"},
+		Required:             []string{"alias", "of", "confidence"},
 		Properties: map[string]*jsonSchema{
+			"confidence": {
+				Type:    "number",
+				Minimum: ptr(0.0),
+				Maximum: ptr(1.0),
+				Description: "How sure you are that the two names are one thing, from 0 " +
+					"to 1. Required.",
+			},
 			"alias": name("The additional name, as the episodes write it."),
 			"of": name("The name it is another name for: one already known, or the " +
 				"subject you are using for it in this answer."),

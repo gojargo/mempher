@@ -25,7 +25,7 @@ const (
 	// deployment's existing facts the previous revision's facts until a
 	// backfill re-derives them. It therefore moves on a minor version and is
 	// called out in the changelog, never on a patch.
-	PromptVersion = 2
+	PromptVersion = 3
 
 	// DefaultMaxAssertions is how many claims one extraction may assert when
 	// [Options.MaxAssertions] does not say.
@@ -35,6 +35,16 @@ const (
 	// statements at their permitted length is more output than a provider will
 	// return in one call. The useful direction for this number is down.
 	DefaultMaxAssertions = 16
+
+	// DefaultMinAliasConfidence is how sure a model must say it is before an
+	// alias it declares is kept, when [Options.MinAliasConfidence] does not
+	// say.
+	//
+	// It is high on purpose. A missed alias costs a duplicate subject, which
+	// an operator can merge later. A wrong one files a person's facts under
+	// someone else, and cannot be undone. Measured on LoCoMo, a small model
+	// with no threshold declared the two people in a conversation to be one.
+	DefaultMinAliasConfidence = 0.9
 
 	// DefaultMaxPromptBytes is how much episode content one extraction will
 	// send when [Options.MaxPromptBytes] does not say.
@@ -73,9 +83,9 @@ type Prompt struct {
 // Implementations must be safe for concurrent use and must honour cancellation.
 // They must also be as close to deterministic as the provider allows:
 // temperature zero, no nucleus sampling. A reclaimed lease replays a job, and a
-// model that answers differently the second time asserts the same claim over an
-// overlapping window, which is [mempher.ErrFactConflict] rather than a merged
-// answer.
+// model that answers differently the second time dates the same claim
+// differently, and which answer the store keeps then depends on which arrived
+// first.
 type Completer interface {
 	// Complete returns the model's response to p, which must be JSON
 	// conforming to p.Schema. An adapter returns those bytes rather than
@@ -91,7 +101,7 @@ type Completer interface {
 // Options tunes the shipped extractor. The zero value works.
 //
 // Every field here except Logger and MaxPromptBytes changes what the model is
-// asked and therefore what it asserts, so every one of them is part of the
+// asked or what is kept of its answer, and therefore what it asserts, so every one of them is part of the
 // extractor's identity. See [Extractor.Model].
 type Options struct {
 	// Predicates, when non-empty, is the closed vocabulary an extraction may
@@ -130,6 +140,11 @@ type Options struct {
 	// It is a salience lever as much as a limit: a model told it may return
 	// four facts chooses more carefully than one told it may return sixty.
 	MaxAssertions int
+
+	// MinAliasConfidence is how sure the model must say it is for an alias it
+	// declares to be kept. Zero means [DefaultMinAliasConfidence]; anything
+	// above 1 keeps none, which turns alias declaration off.
+	MinAliasConfidence float64
 
 	// Reconcile spends a first, cheap model call naming the subjects and
 	// relations the episodes touch, so that the extraction itself is shown only
@@ -201,12 +216,18 @@ func New(c Completer, opts Options) (*Extractor, error) {
 		return nil, fmt.Errorf(
 			"mempher/extract: new: MaxAssertions is %d, but a FactStore accepts at most %d: %w",
 			opts.MaxAssertions, mempher.MaxAssertionsPerExtraction, mempher.ErrInvalidConfig)
+	case opts.MinAliasConfidence < 0:
+		return nil, fmt.Errorf("mempher/extract: new: MinAliasConfidence is %v: %w",
+			opts.MinAliasConfidence, mempher.ErrInvalidConfig)
 	case opts.MaxPromptBytes < 0:
 		return nil, fmt.Errorf("mempher/extract: new: MaxPromptBytes is %d: %w",
 			opts.MaxPromptBytes, mempher.ErrInvalidConfig)
 	}
 	if opts.MaxAssertions == 0 {
 		opts.MaxAssertions = DefaultMaxAssertions
+	}
+	if opts.MinAliasConfidence == 0 {
+		opts.MinAliasConfidence = DefaultMinAliasConfidence
 	}
 	if opts.MaxPromptBytes == 0 {
 		opts.MaxPromptBytes = DefaultMaxPromptBytes
@@ -269,7 +290,7 @@ func New(c Completer, opts Options) (*Extractor, error) {
 // Model returns the extractor id: this package's prompt revision, the provider
 // model, and a digest of [Options].
 //
-//	mempher-extract/v2+claude-opus-5+a3f9c1e2
+//	mempher-extract/v3+claude-opus-5+a3f9c1e2
 //
 // All three belong in it. Facts are keyed by extractor precisely so that two
 // extractors' opinions never merge into one scope, and changing the
@@ -451,6 +472,7 @@ func digest(opts Options) string {
 	write("instructions", opts.Instructions)
 	write("assertions", strconv.Itoa(opts.MaxAssertions))
 	write("reconcile", strconv.FormatBool(opts.Reconcile))
+	write("alias", strconv.FormatFloat(opts.MinAliasConfidence, 'g', -1, 64))
 	for _, p := range opts.Predicates {
 		write("predicate", string(p))
 	}

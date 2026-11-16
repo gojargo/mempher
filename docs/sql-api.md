@@ -39,12 +39,12 @@ SELECT * FROM mempher.append('user:8123',
 SELECT mempher.recall('user:8123', 'any food allergies?',
   p_embedding  := $1,
   p_model      := 'text-embedding-3-small',
-  p_extractor  := 'mempher-extract/v2+claude-opus-5+a3f9c1e2',
+  p_extractor  := 'mempher-extract/v3+claude-opus-5+a3f9c1e2',
   p_max_tokens := 2000);
 
 -- What was true on a given day.
 SELECT statement, valid FROM mempher.search_facts('user:8123',
-  'mempher-extract/v2+claude-opus-5+a3f9c1e2', p_at := '2020-06-01');
+  'mempher-extract/v3+claude-opus-5+a3f9c1e2', p_at := '2020-06-01');
 ```
 
 ## A worker in any language
@@ -69,6 +69,9 @@ the queue functions.
 - Every function is `SECURITY INVOKER` with a pinned `search_path`.
 - Writes are idempotent where a retry is possible: applying the same
   extraction twice changes nothing the second time.
+- An assertion of a claim already held over an overlapping window does not
+  fail and does not add a row: the stored window stands and the fact gains
+  the new episodes as provenance.
 
 ## Errors
 

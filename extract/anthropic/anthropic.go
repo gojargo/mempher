@@ -177,9 +177,9 @@ func (c *Completer) Complete(ctx context.Context, p extract.Prompt) ([]byte, err
 		Model:     c.model,
 		MaxTokens: c.maxTokens,
 		// Zero, and not configurable. A reclaimed lease replays a job, and an
-		// extractor that answers differently the second time asserts the same
-		// claim over an overlapping window -- which is ErrFactConflict, not a
-		// merged answer. Sampling is not a knob worth exposing here.
+		// extractor that answers differently the second time dates the same
+		// claim differently, so what is kept depends on which answer landed
+		// first. Sampling is not a knob worth exposing here.
 		Temperature: 0,
 		System:      p.System,
 		Messages:    []message{{Role: "user", Content: p.User}},
