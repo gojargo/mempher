@@ -24,7 +24,7 @@ jobs:
         with:
           # Pinned so a new golangci-lint release can't break CI by adding
           # findings out from under a green tree; bump this deliberately.
-          version: v2.13.2
+          version: v2.14.0
 
   test:
     runs-on: ubuntu-latest
