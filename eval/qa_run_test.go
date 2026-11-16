@@ -46,7 +46,11 @@ import (
 // QA_QUESTIONS caps the run, QA_PARALLEL answers that many questions of one
 // haystack at once, QA_RPS caps requests per second across every model, and
 // QA_K and QA_MAX_TOKENS set the recall limit and budget, and QA_VARIANTS
-// keeps only some of "episodes", "episodes and facts" and "facts".
+// keeps only some of "episodes", "episodes and facts" and "facts". QA_SIZES
+// measures one ingestion at several recall sizes instead.
+//
+// QA_PROTOCOL=zep writes and grades answers with the prompts of Zep's LoCoMo
+// harness, and QA_RECORD=/path/to/answers.jsonl keeps every answer.
 //
 // BEAM=/path/to/beam-1M.jsonl runs BEAM, converted as [eval.BEAM] describes.
 // Its conversations are long enough that QA_HAYSTACKS, how many are ingested
@@ -146,6 +150,28 @@ func TestQA(t *testing.T) {
 			eval.Variant{Name: "episodes and facts", Channels: append(episodes, mempher.ChannelFact)},
 			eval.Variant{Name: "facts", Channels: []mempher.Channel{mempher.ChannelFact}})
 	}
+	// QA_SIZES replaces the variants with episodes and facts recalled at
+	// several sizes, as "episodes:facts" pairs, comma-separated: "5:8,10:32"
+	// answers every question twice from one ingestion.
+	if sizes := os.Getenv("QA_SIZES"); sizes != "" {
+		variants = nil
+		for _, size := range strings.Split(sizes, ",") {
+			k, f, ok := strings.Cut(strings.TrimSpace(size), ":")
+			limit, errK := strconv.Atoi(k)
+			facts, errF := strconv.Atoi(f)
+			if !ok || errK != nil || errF != nil || limit <= 0 || facts < 0 {
+				t.Fatalf("QA_SIZES: %q is not episodes:facts", size)
+			}
+			channels := slices.Clone(episodes)
+			if facts > 0 {
+				channels = append(channels, mempher.ChannelFact)
+			}
+			variants = append(variants, eval.Variant{
+				Name:     fmt.Sprintf("%d episodes, %d facts", limit, facts),
+				Channels: channels, Limit: limit, FactLimit: facts,
+			})
+		}
+	}
 	// QA_VARIANTS keeps only the named variants, comma-separated: every
 	// variant is a judged answer per question, which is most of a run's cost.
 	if names := os.Getenv("QA_VARIANTS"); names != "" {
@@ -156,6 +182,18 @@ func TestQA(t *testing.T) {
 		if len(variants) == 0 {
 			t.Fatalf("QA_VARIANTS=%q names no variant", names)
 		}
+	}
+
+	// QA_RECORD writes every answer, with its context and verdict, as JSON
+	// lines to a file.
+	var record io.Writer
+	if path := os.Getenv("QA_RECORD"); path != "" {
+		f, err := os.Create(path)
+		if err != nil {
+			t.Fatalf("QA_RECORD: %v", err)
+		}
+		defer func() { _ = f.Close() }()
+		record = f
 	}
 
 	failures := 0
@@ -171,6 +209,8 @@ func TestQA(t *testing.T) {
 		MaxTokens: intFromEnv("QA_MAX_TOKENS", 0),
 		Parallel:  intFromEnv("QA_PARALLEL", 4),
 		Haystacks: intFromEnv("QA_HAYSTACKS", 1),
+		Protocol:  eval.QAProtocol(os.Getenv("QA_PROTOCOL")),
+		Record:    record,
 		Outstanding: func(ctx context.Context, scope mempher.ScopeID) (int, error) {
 			jobs, err := store.Jobs(ctx, ops.JobQuery{
 				Scope:  scope,

@@ -9,6 +9,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"slices"
 	"strings"
 	"sync"
@@ -70,12 +71,36 @@ type QAConfig struct {
 	// Haystacks is above one; otherwise a drain that finds the queue empty is
 	// taken to have finished.
 	Outstanding func(ctx context.Context, scope mempher.ScopeID) (int, error)
+	// Protocol chooses the prompts that write and grade answers. Empty means
+	// mempher's own.
+	Protocol QAProtocol
+	// Record, when set, receives one JSON line per question and variant: the
+	// context the answer was written from, the answer and the verdict. It is
+	// what lets a run be checked, and its context counted with another
+	// tokenizer, after the fact.
+	Record io.Writer
 	// Progress, when set, is called after each question of the first variant.
 	Progress func(done int, last QAResult)
 
+	// record serialises writes to Record.
+	record *sync.Mutex
 	// style is the dataset's [Dataset.AnswerStyle].
 	style string
 }
+
+// QAProtocol names the prompts a run writes and grades answers with.
+type QAProtocol string
+
+const (
+	// ProtocolMempher is this package's own answer and judge prompts.
+	ProtocolMempher QAProtocol = ""
+	// ProtocolZep is the answer and grader prompts of Zep's LoCoMo harness
+	// (getzep/zep, benchmarks/locomo, Apache-2.0), so that a run can be set
+	// beside the results Zep publishes from it. Only the memory differs: the
+	// context is mempher's facts and messages rather than Zep's facts and
+	// entities, and the answer is returned as JSON with one field.
+	ProtocolZep QAProtocol = "zep"
+)
 
 // QAResult is what one question came to under one variant.
 type QAResult struct {
@@ -85,6 +110,8 @@ type QAResult struct {
 	// Expected is the benchmark's answer, and Response the one given.
 	Expected string
 	Response string
+	// Context is the memory the answer was written from, as the model saw it.
+	Context string
 	// Correct is the judge's verdict. Under a rubric it means every item was
 	// fully met.
 	Correct bool
@@ -174,6 +201,8 @@ func RunQA(ctx context.Context, cfg QAConfig, ds Dataset) ([]QASummary, error) {
 	case cfg.Parallel < 0 || cfg.Attempts < 0 || cfg.Haystacks < 0:
 		return nil, fmt.Errorf("eval: run qa: Parallel, Attempts and Haystacks must not be negative: %w",
 			mempher.ErrInvalidConfig)
+	case cfg.Protocol != ProtocolMempher && cfg.Protocol != ProtocolZep:
+		return nil, fmt.Errorf("eval: run qa: unknown protocol %q: %w", cfg.Protocol, mempher.ErrInvalidConfig)
 	case cfg.Haystacks > 1 && cfg.Outstanding == nil:
 		return nil, fmt.Errorf("eval: run qa: Outstanding is required to answer haystacks in parallel: %w",
 			mempher.ErrInvalidConfig)
@@ -182,6 +211,7 @@ func RunQA(ctx context.Context, cfg QAConfig, ds Dataset) ([]QASummary, error) {
 		cfg.Haystacks = 1
 	}
 	cfg.style = ds.AnswerStyle
+	cfg.record = &sync.Mutex{}
 	if cfg.Limit == 0 {
 		cfg.Limit = DefaultLimit
 	}
@@ -321,6 +351,7 @@ func runQAGroup(ctx context.Context, cfg QAConfig, group []Question) ([][]QAResu
 			defer func() { <-slots }()
 			for vi, variant := range cfg.Variants {
 				results[qi][vi] = answerOne(ctx, cfg, scope, question, variant)
+				record(cfg, variant, results[qi][vi])
 			}
 		}()
 	}
@@ -353,8 +384,8 @@ func answerOne(
 		Scope:     scope,
 		Query:     q.Query,
 		Channels:  variant.Channels,
-		Limit:     cfg.Limit,
-		FactLimit: cfg.FactLimit,
+		Limit:     cmp.Or(variant.Limit, cfg.Limit),
+		FactLimit: cmp.Or(variant.FactLimit, cfg.FactLimit),
 		MaxTokens: cfg.MaxTokens,
 	}
 	if cfg.BoundByQuestionTime {
@@ -368,7 +399,11 @@ func answerOne(
 	}
 	out.Recall = time.Since(started)
 	out.Facts, out.Episodes, out.Tokens = len(recollection.Facts), len(recollection.Episodes), recollection.Tokens
-	out.Hit = score(q, recollection, cfg.Limit).Hit
+	out.Hit = score(q, recollection, request.Limit).Hit
+	out.Context = memoryBlock(recollection)
+	if cfg.Protocol == ProtocolZep {
+		return zepAnswer(ctx, cfg, q, variant, recollection, out)
+	}
 
 	var answer struct {
 		Answer *string `json:"answer"`
@@ -514,15 +549,23 @@ var (
 		`"correct":{"type":"boolean"}}}`)
 )
 
-// answerPrompt lays out what recall returned for a reader: the facts, then the
-// episodes in the order they were said, whatever order they were ranked in. A
-// conversation read out of order answers "what happened first" wrongly.
+// answerPrompt is the user prompt of mempher's own protocol: the day the
+// question is asked, what recall returned, and the question.
 func answerPrompt(q Question, rec mempher.Recollection) string {
 	var b strings.Builder
 	if !q.Asked.IsZero() {
 		fmt.Fprintf(&b, "Today is %s.\n\n", q.Asked.Format("Monday 2 January 2006"))
 	}
+	b.WriteString(memoryBlock(rec))
+	fmt.Fprintf(&b, "\nQUESTION\n\n%s\n", q.Query)
+	return b.String()
+}
 
+// memoryBlock lays out what recall returned for a reader: the facts, then the
+// episodes in the order they were said, whatever order they were ranked in. A
+// conversation read out of order answers "what happened first" wrongly.
+func memoryBlock(rec mempher.Recollection) string {
+	var b strings.Builder
 	b.WriteString("FACTS\n\n")
 	if len(rec.Facts) == 0 {
 		b.WriteString("None.\n")
@@ -550,8 +593,6 @@ func answerPrompt(q Question, rec mempher.Recollection) string {
 		fmt.Fprintf(&b, "[%s] %s: %s\n",
 			e.Episode.OccurredAt.Format("Mon 2 Jan 2006 15:04"), e.Episode.Role, e.Episode.Content)
 	}
-
-	fmt.Fprintf(&b, "\nQUESTION\n\n%s\n", q.Query)
 	return b.String()
 }
 
@@ -757,4 +798,37 @@ var rubricSchema = json.RawMessage(`{"type":"object","additionalProperties":fals
 // validRubricScore holds a judge to the three scores the rubric allows.
 func validRubricScore(score float64) bool {
 	return score == 0 || score == 0.5 || score == 1
+}
+
+// record writes one result to [QAConfig.Record]. A failed write is not worth
+// a run, so it is dropped.
+func record(cfg QAConfig, variant Variant, r QAResult) {
+	if cfg.Record == nil {
+		return
+	}
+	line := struct {
+		Variant  string  `json:"variant"`
+		ID       string  `json:"id"`
+		Type     string  `json:"type"`
+		Expected string  `json:"expected"`
+		Context  string  `json:"context"`
+		Response string  `json:"response"`
+		Correct  bool    `json:"correct"`
+		Score    float64 `json:"score"`
+		Hit      bool    `json:"hit"`
+		Error    string  `json:"error,omitempty"`
+	}{
+		Variant: variant.Name, ID: r.ID, Type: r.Type, Expected: r.Expected, Context: r.Context,
+		Response: r.Response, Correct: r.Correct, Score: r.Score, Hit: r.Hit,
+	}
+	if r.Err != nil {
+		line.Error = r.Err.Error()
+	}
+	raw, err := json.Marshal(line)
+	if err != nil {
+		return
+	}
+	cfg.record.Lock()
+	defer cfg.record.Unlock()
+	_, _ = cfg.Record.Write(append(raw, '\n'))
 }

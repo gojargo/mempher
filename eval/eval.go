@@ -127,6 +127,11 @@ type Variant struct {
 	Channels []mempher.Channel
 	// Memory overrides [Config.Memory] for this variant alone.
 	Memory *mempher.Memory
+	// Limit and FactLimit, when positive, override how many episodes and
+	// facts recall returns for this variant alone, so that one ingestion can
+	// be measured at several context sizes. Used by [RunQA] only.
+	Limit     int
+	FactLimit int
 }
 
 // DefaultLimit is the k used when [Config.Limit] is zero. It matches
