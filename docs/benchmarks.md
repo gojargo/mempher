@@ -92,6 +92,30 @@ date formats, and to require the same answer.
 - The run took 38 minutes. [Comparison](comparison.md) puts it next to the
   figures published for other systems.
 
+### Graded with Zep's prompts
+
+The answer and grader prompts of Zep's LoCoMo harness, with `gpt-4o-mini` for
+extraction, answers and grading, and `text-embedding-3-small`. One ingestion,
+measured at three recall sizes. Context is counted with tiktoken.
+
+| Recall returns | accuracy | single-hop | temporal | multi-hop | open-domain | context |
+| --- | --- | --- | --- | --- | --- | --- |
+| 5 episodes, 8 facts | 0.764 | 0.839 | 0.704 | 0.649 | 0.635 | 497 tokens |
+| 10 episodes, 32 facts | 0.793 | 0.881 | 0.673 | 0.699 | 0.698 | 1,278 tokens |
+| 20 episodes, 32 facts | 0.806 | 0.905 | 0.642 | 0.748 | 0.667 | 1,796 tokens |
+
+- The extractor kept 965 facts, and every extraction job succeeded. The run
+  took 25 minutes.
+- More context helps multi-hop and single-hop questions and hurts temporal
+  ones, which fall from 0.704 to 0.642.
+- [Comparison](comparison.md) sets these beside Zep's published runs.
+
+Reproduce with `make qa LOCOMO=/path/to/locomo10.json QA_PROTOCOL=zep
+QA_ANSWER_MODEL=gpt-4o-mini QA_JUDGE_MODEL=gpt-4o-mini
+QA_EXTRACT_MODEL=gpt-4o-mini QA_EMBED_MODEL=text-embedding-3-small
+QA_EMBED_DIMS=1536 QA_MAX_ASSERTIONS=64 QA_SIZES=5:8,10:32,20:32` and
+`QA_URL`, `QA_API_KEY`.
+
 ### Mistral models
 
 | Recall returns | accuracy | single-hop | temporal | multi-hop | open-domain | context |

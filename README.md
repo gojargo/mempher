@@ -160,6 +160,14 @@ Errors are omitted here. `embedder` and `extractor` are two small interfaces;
 implementations for OpenAI-compatible and Anthropic APIs are included. See
 [docs/models.md](docs/models.md).
 
+## Results
+
+On LoCoMo, graded with the prompts and models of Zep's published harness,
+mempher scores 0.764 with about 500 tokens of context per question and 0.806
+with about 1,800, where Zep's published runs score 0.737 and 0.803. The
+setups, and what differs between them, are in
+[docs/comparison.md](docs/comparison.md).
+
 ## Requirements
 
 - PostgreSQL 18 or newer

@@ -14,7 +14,44 @@
 | Erasing a user | one transaction, with every derived row | through the API | through the API | your own deletes |
 | License | Apache 2.0 | Apache 2.0 | Apache 2.0 (Graphiti) | not applicable |
 
-## Scores on LoCoMo
+## LoCoMo, graded like Zep
+
+Zep publishes the harness behind its LoCoMo results
+([getzep/zep, benchmarks/locomo](https://github.com/getzep/zep/tree/main/benchmarks/locomo)),
+with ten runs of each configuration and every answer. mempher was run with the
+same answer prompt and grader prompt, word for word, the same models
+(`gpt-4o-mini` at temperature 0 for answers and grading) and the same 1,540
+questions. Context is counted the same way, with tiktoken over the whole
+context string.
+
+| Context per question | Zep, mean of 10 runs | mempher, 1 run |
+| --- | --- | --- |
+| 347 tokens | 0.696 | |
+| about 500 tokens | 0.737 (504 tokens) | 0.764 (497 tokens) |
+| 756 tokens | 0.771 | |
+| about 1,300 tokens | 0.801 (1,377 tokens) | 0.793 (1,278 tokens) |
+| about 1,800 to 2,000 tokens | 0.803 (1,996 tokens) | 0.806 (1,796 tokens) |
+
+mempher recalled 5 messages and 8 facts, 10 and 32, and 20 and 32. Zep's runs
+recall 5 to 30 facts and 2 to 30 entities from Zep Cloud, with a cross-encoder
+reranker. mempher used `gpt-4o-mini` to extract facts and
+`text-embedding-3-small` to embed, on PostgreSQL alone.
+
+What differs:
+
+- The context is each system's own: Zep's facts and entities, mempher's facts
+  and messages. Zep's prompt says a timestamp is when an event happened;
+  mempher's messages are dated when they were sent, which the context states.
+- mempher's answers are returned as JSON with one field, Zep's as text.
+- Zep's figures are the mean of ten runs, whose spread is about half a point.
+  mempher's are one run.
+- Zep's runs date from December 2025. Its site reports higher figures from
+  other models and settings, which were not reproduced.
+
+Every answer, with its context and verdict, is kept by `QA_RECORD`; the
+setting is in [benchmarks](benchmarks.md).
+
+## Scores on LoCoMo, mem0 paper setup
 
 The published LoCoMo figures most often compared are those of the mem0
 paper ([arXiv 2504.19413](https://arxiv.org/abs/2504.19413), table 2). In
