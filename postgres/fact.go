@@ -144,30 +144,6 @@ func (s *Store) Facts(ctx context.Context, q mempher.FactQuery) ([]mempher.Fact,
 	return facts, nil
 }
 
-// anyLexemeQuery builds a tsquery that matches any one of a text's lexemes. Both
-// retrieval channels use it: facts for ordering, episodes for matching.
-//
-// It was written for facts, where the query only orders and AND would have
-// scored every fact zero unless one statement happened to hold every word. The
-// episode channel kept websearch_to_tsquery on the reasoning that matching is
-// not ordering, so there AND was the careful choice. Measurement said otherwise:
-// a conversational question has its words spread across a conversation, not
-// gathered in one turn, and AND left 83% of LongMemEval questions matching
-// nothing at all. Both channels want the same thing -- everything that shares
-// anything, best overlap first.
-//
-// The lexemes come from to_tsvector under the schema's own configuration, so
-// they are stemmed exactly as the indexed column was, and quote_literal makes
-// each one a literal rather than something the tsquery parser might read as an
-// operator. Text that is nothing but stop words yields the empty tsquery, which
-// ranks everything zero and leaves the ordering to the tie-break.
-func anyLexemeQuery(config, text string) string {
-	return fmt.Sprintf(
-		`COALESCE((SELECT string_agg(quote_literal(lexeme), ' | ')`+
-			` FROM unnest(to_tsvector(%s::regconfig, %s)))::tsquery, ''::tsquery)`,
-		config, text)
-}
-
 // factByIDSQL reads one fact within a scope. The scope is part of the predicate,
 // not checked afterwards, so a fact addressed from the wrong scope is absent
 // rather than refused.

@@ -108,6 +108,47 @@ type Candidate struct {
 	Score float64
 }
 
+// RecallQuery is a [RecallRequest] as [Memory.Recall] hands it to a [Store]:
+// every default resolved, every cut fixed, and the question already embedded.
+//
+// Channels is what to run, deduplicated and in order. ChannelSemantic is only
+// in it with a Vector and the Model that produced it, and ChannelFact only with
+// an Extractor; a channel that could not be prepared is left out and reported
+// by Memory, not by the Store.
+type RecallQuery struct {
+	Scope    ScopeID
+	Text     string
+	Channels []Channel
+
+	Vector    Vector
+	Model     ModelID
+	Extractor ExtractorID
+
+	AsOf         time.Time
+	OccurredFrom time.Time
+	OccurredTo   time.Time
+	Binding      Binding
+	Roles        []Role
+
+	Subjects          []Subject
+	MinFactConfidence float32
+
+	// Limit is the most episodes to return, CandidatesPerChannel how deep each
+	// channel looks (never less than Limit), and FactLimit the most facts.
+	Limit                int
+	CandidatesPerChannel int
+	FactLimit            int
+
+	// MaxTokens is the budget, spent on facts first and then on episodes in
+	// order, counted as [ApproxTokenCounter] counts with BytesPerToken. Zero
+	// means no budget: Memory applies any other [TokenCounter] itself.
+	MaxTokens     int
+	BytesPerToken int
+
+	// Fusion is resolved: K is set, and the lexical weight is present.
+	Fusion FusionOptions
+}
+
 // RecallRequest asks for the episodes most worth putting in front of a model.
 type RecallRequest struct {
 	// Scope restricts the search to one partition. Required.

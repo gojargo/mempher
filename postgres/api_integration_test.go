@@ -1,7 +1,11 @@
 package postgres_test
 
 import (
+	"encoding/json"
 	"errors"
+	"math"
+	"slices"
+	"strconv"
 	"strings"
 	"testing"
 
@@ -377,5 +381,161 @@ func TestSQLProjections(t *testing.T) {
 			`SELECT mempher.put_encodings('m', ARRAY[$1::uuid], ARRAY['[1,2]'::vector])`, episode), "MP021")
 		wantSQLState(t, exec(t, pool,
 			`SELECT mempher.put_encodings('m', ARRAY[$1::uuid], '{}'::vector[])`, episode), "MP013")
+	})
+}
+
+// axes renders a testDimensions-wide vector literal with the given leading
+// components and zeros after them.
+func axes(components ...float64) string {
+	parts := make([]string, testDimensions)
+	for i := range parts {
+		parts[i] = "0"
+		if i < len(components) {
+			parts[i] = strconv.FormatFloat(components[i], 'g', -1, 64)
+		}
+	}
+	return "[" + strings.Join(parts, ",") + "]"
+}
+
+func TestSQLRecall(t *testing.T) {
+	t.Parallel()
+	_, pool := migrated(t)
+	ctx := t.Context()
+
+	// Three episodes whose ranks are known in both channels. Against the
+	// query vector (1,0): "apple" is nearest, "banana apple" next, "cherry"
+	// last. Against the word "banana", only the second matches.
+	var ids []string
+	rows, err := pool.Query(ctx, `
+		SELECT id::text FROM mempher.append('r', '[
+			{"content":"apple","role":"user","source":"s"},
+			{"content":"banana apple","role":"user","source":"s"},
+			{"content":"cherry","role":"user","source":"s"}]', '2026-01-01')`)
+	if err != nil {
+		t.Fatalf("append: %v", err)
+	}
+	for rows.Next() {
+		var id string
+		if err := rows.Scan(&id); err != nil {
+			t.Fatalf("scan: %v", err)
+		}
+		ids = append(ids, id)
+	}
+	if err := rows.Err(); err != nil {
+		t.Fatalf("rows: %v", err)
+	}
+	if err := exec(t, pool, `SELECT mempher.put_encodings('m', $1::uuid[], ARRAY[$2, $3, $4]::vector[], '2026-01-01')`,
+		ids, axes(1, 0), axes(1, 1), axes(0, 1)); err != nil {
+		t.Fatalf("put_encodings: %v", err)
+	}
+
+	type hit struct {
+		Channel string  `json:"channel"`
+		Rank    int     `json:"rank"`
+		Score   float64 `json:"score"`
+	}
+	type doc struct {
+		Episodes []struct {
+			ID      string  `json:"id"`
+			Content string  `json:"content"`
+			Score   float64 `json:"score"`
+			Hits    []hit   `json:"hits"`
+		} `json:"episodes"`
+		Channels []struct {
+			Channel    string `json:"channel"`
+			Candidates int    `json:"candidates"`
+		} `json:"channels"`
+		Truncated bool `json:"truncated"`
+	}
+	recall := func(t *testing.T, sql string, args ...any) doc {
+		t.Helper()
+		var raw []byte
+		if err := pool.QueryRow(ctx, sql, args...).Scan(&raw); err != nil {
+			t.Fatalf("recall: %v", err)
+		}
+		var d doc
+		if err := json.Unmarshal(raw, &d); err != nil {
+			t.Fatalf("decode %s: %v", raw, err)
+		}
+		return d
+	}
+	order := func(d doc) []string {
+		out := make([]string, len(d.Episodes))
+		for i, e := range d.Episodes {
+			out[i] = e.Content
+		}
+		return out
+	}
+
+	t.Run("agreement across channels outranks a bare first place", func(t *testing.T) {
+		d := recall(t, `SELECT mempher.recall('r', 'banana', $1::vector, 'm', p_as_of := '2026-02-01')`, axes(1, 0))
+		if got := order(d); !slices.Equal(got, []string{"banana apple", "apple", "cherry"}) {
+			t.Fatalf("order = %v", got)
+		}
+		// Semantic rank 2 plus a quarter-weighted lexical rank 1, at K = 60.
+		want := 1.0/62 + 0.25/61
+		if got := d.Episodes[0].Score; math.Abs(got-want) > 1e-12 {
+			t.Errorf("fused score = %v, want %v", got, want)
+		}
+		hits := d.Episodes[0].Hits
+		if len(hits) != 2 || hits[0].Channel != "lexical" || hits[0].Rank != 1 ||
+			hits[1].Channel != "semantic" || hits[1].Rank != 2 {
+			t.Errorf("hits = %+v, want lexical rank 1 then semantic rank 2", hits)
+		}
+		if len(d.Channels) != 2 || d.Channels[0].Candidates != 3 || d.Channels[1].Candidates != 1 {
+			t.Errorf("channels = %+v, want semantic with 3 candidates and lexical with 1", d.Channels)
+		}
+	})
+
+	t.Run("a zero weight scores nothing but is still reported", func(t *testing.T) {
+		d := recall(t, `SELECT mempher.recall('r', 'banana', $1::vector, 'm', p_as_of := '2026-02-01',
+			p_weights := '{"lexical": 0}')`, axes(1, 0))
+		if got := order(d); !slices.Equal(got, []string{"apple", "banana apple", "cherry"}) {
+			t.Fatalf("order = %v, want the semantic order alone", got)
+		}
+		if len(d.Episodes[1].Hits) != 2 {
+			t.Errorf("hits = %+v, want the lexical hit still reported", d.Episodes[1].Hits)
+		}
+	})
+
+	t.Run("a smaller K sharpens the advantage of first place", func(t *testing.T) {
+		d := recall(t, `SELECT mempher.recall('r', 'banana', $1::vector, 'm', p_as_of := '2026-02-01',
+			p_fusion_k := 1)`, axes(1, 0))
+		if got := order(d); got[0] != "apple" {
+			t.Errorf("order = %v, want the semantic first place to win at K = 1", got)
+		}
+	})
+
+	t.Run("ties break towards the newer episode", func(t *testing.T) {
+		d := recall(t, `SELECT mempher.recall('r', NULL, $1::vector, 'm', p_as_of := '2026-02-01')`, axes(0, 0, 1))
+		// Every episode is orthogonal to (0,0,1), so all score the same.
+		if got := order(d); !slices.Equal(got, []string{"cherry", "banana apple", "apple"}) {
+			t.Errorf("order = %v, want newest first", got)
+		}
+	})
+
+	t.Run("the limit cuts, and says so", func(t *testing.T) {
+		d := recall(t, `SELECT mempher.recall('r', 'apple banana cherry', p_limit := 2, p_as_of := '2026-02-01')`)
+		if len(d.Episodes) != 2 || !d.Truncated {
+			t.Errorf("%d episodes, truncated %v; want 2 and true", len(d.Episodes), d.Truncated)
+		}
+	})
+
+	t.Run("as_of hides what was not yet ingested", func(t *testing.T) {
+		d := recall(t, `SELECT mempher.recall('r', 'apple', p_as_of := '2025-12-31')`)
+		if len(d.Episodes) != 0 {
+			t.Errorf("recalled %v before anything was ingested", order(d))
+		}
+	})
+
+	t.Run("rejects", func(t *testing.T) {
+		wantSQLState(t, exec(t, pool, `SELECT mempher.recall('r', NULL)`), "MP002")
+		wantSQLState(t, exec(t, pool, `SELECT mempher.recall('r', 'x', p_channels := ARRAY['graph'])`), "MP007")
+		wantSQLState(t, exec(t, pool, `SELECT mempher.recall('r', 'x', p_channels := ARRAY['semantic'])`), "MP013")
+		wantSQLState(t, exec(t, pool, `SELECT mempher.recall('r', 'x', p_channels := ARRAY['fact'])`), "MP013")
+		wantSQLState(t, exec(t, pool, `SELECT mempher.recall('r', 'x', '[1,2]'::vector, 'm')`), "MP021")
+		wantSQLState(t, exec(t, pool, `SELECT mempher.recall('r', 'x', p_weights := '{"lexical": -1}')`), "MP013")
+		wantSQLState(t, exec(t, pool, `SELECT mempher.recall('r', 'x', p_roles := ARRAY['bot'])`), "MP003")
+		wantSQLState(t, exec(t, pool, `SELECT mempher.recall('r', 'x', p_occurred_from := '2026-02-01', p_occurred_to := '2026-01-01')`), "MP013")
 	})
 }

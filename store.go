@@ -16,9 +16,10 @@ import "context"
 // Removing one is the single exception, and it has exactly one method, so that
 // the whole of erasure is one thing to find, review and audit. See [Store.Forget].
 //
-// Retrieval is split per channel rather than exposed as one fused query so that
-// [Memory.Recall] can run the channels concurrently and gain a channel later
-// without rewriting a single large statement.
+// Retrieval is one call rather than one per channel, so that the channels,
+// their fusion and the budget all run where the data is, in one round trip. The
+// postgres adapter implements it as the mempher.recall function, which a client
+// in any language can call.
 //
 // What a Store needs for operating a deployment rather than serving it -- the
 // scope catalogue, and the anti-join saying what work is outstanding -- is
@@ -36,12 +37,11 @@ type Store interface {
 	// after afterSeq. It is how a projection is rebuilt from L0.
 	Replay(ctx context.Context, scope ScopeID, afterSeq int64, limit int) ([]Episode, error)
 
-	// SearchSemantic returns the nearest episodes by cosine distance over one
-	// model's encodings, best first.
-	SearchSemantic(ctx context.Context, q SemanticQuery) ([]Candidate, error)
-
-	// SearchLexical returns the best full-text matches, best first.
-	SearchLexical(ctx context.Context, q LexicalQuery) ([]Candidate, error)
+	// Recall runs a resolved query's channels, fuses the episode channels by
+	// reciprocal rank, reads the facts the query's extractor holds, and
+	// spends the token budget, facts first. It reports each channel it ran,
+	// with how many candidates it found and how long it took.
+	Recall(ctx context.Context, q RecallQuery) (Recollection, error)
 
 	// PutEncoding writes one encoding, replacing any existing one for the
 	// same episode and model, which is what makes encode jobs safe to retry.

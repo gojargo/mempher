@@ -7,7 +7,6 @@ import (
 	"errors"
 	"fmt"
 	"slices"
-	"sync"
 	"time"
 )
 
@@ -246,25 +245,29 @@ func (m *Memory) AppendBatch(ctx context.Context, reqs []AppendRequest) ([]Episo
 }
 
 // Recall returns the episodes most worth putting in front of a model, best
-// first, each with the provenance of why it was chosen.
+// first, each with the provenance of why it was chosen, and the facts the scope
+// currently believes.
 //
-// This is the read loop: embed the query, run the requested channels
-// concurrently with their filters pushed into SQL, fuse the rankings, cut to the
-// limit and token budget, return. No model call beyond the query embedding.
+// This is the read loop: embed the query, then one call to the [Store], which
+// runs the channels with their filters, fuses the episode rankings by
+// reciprocal rank, reads L1 and spends the token budget, facts first. Embedding
+// the query is the only model call.
 //
 // A failed channel is reported in [Recollection.Channels] and the rest still
-// answer. Recall fails with [ErrAllChannelsFailed] only when none succeeded, so
+// answer: an embedder that is down costs the semantic channel, not the recall.
+// Recall fails with [ErrAllChannelsFailed] only when nothing could be asked, so
 // a thin answer is never mistaken for an empty memory.
 //
-// The result is deterministic: channels are fused from fixed slots, and ties
-// break towards the newer episode at every stage. The one exception is a set of
-// episodes tied on score exactly at a channel's own limit, where which of them
-// the database returned is arbitrary.
+// The result is deterministic: ties break towards the newer episode at every
+// stage. The one exception is a set of episodes tied on score exactly at a
+// channel's own limit, where which of them the database returned is arbitrary.
 func (m *Memory) Recall(ctx context.Context, req RecallRequest) (Recollection, error) {
 	if err := req.Validate(); err != nil {
 		return Recollection{}, err
 	}
 
+	// Every cut is resolved once, here: two channels resolving "now" a
+	// millisecond apart would make a result that cannot be replayed.
 	asOf := req.AsOf
 	if asOf.IsZero() {
 		asOf = m.clock.Now()
@@ -277,190 +280,129 @@ func (m *Memory) Recall(ctx context.Context, req RecallRequest) (Recollection, e
 	if depth == 0 {
 		depth = DefaultCandidatesPerChannel
 	}
-	// Fusion needs more to work with than it returns, so a caller who asks for
-	// a deep result and a shallow search gets the deeper of the two.
-	depth = max(depth, limit)
-
 	factLimit := req.FactLimit
 	if factLimit == 0 {
 		factLimit = DefaultFactLimit
 	}
 
-	// The event-time instant facts must hold at. An explicit event-time window
-	// means the caller is asking about its end; otherwise the cut is AsOf,
-	// which is the clock unless the caller pinned it to reproduce a result.
-	factsAt := req.OccurredTo
-	if factsAt.IsZero() {
-		factsAt = asOf
+	q := RecallQuery{
+		Scope:                req.Scope,
+		Text:                 req.Query,
+		AsOf:                 asOf,
+		OccurredFrom:         req.OccurredFrom,
+		OccurredTo:           req.OccurredTo,
+		Binding:              req.Binding.Clone(),
+		Roles:                slices.Clone(req.Roles),
+		Subjects:             slices.Clone(req.Subjects),
+		MinFactConfidence:    req.MinFactConfidence,
+		Limit:                limit,
+		CandidatesPerChannel: max(depth, limit),
+		FactLimit:            factLimit,
+		Fusion:               m.fusion,
+	}
+	// The approximate counter is the one the database can apply itself. Any
+	// other is applied here, over what the database returns unbudgeted.
+	approx, counterInSQL := m.tokens.(ApproxTokenCounter)
+	if counterInSQL {
+		q.MaxTokens = req.MaxTokens
+		q.BytesPerToken = approx.BytesPerToken
 	}
 
-	channels := m.resolveChannels(req.Channels)
-	plan := recallPlan{
-		text: req.Query,
-		episodes: ChannelQuery{
-			Scope:        req.Scope,
-			AsOf:         asOf,
-			OccurredFrom: req.OccurredFrom,
-			OccurredTo:   req.OccurredTo,
-			Binding:      req.Binding.Clone(),
-			Roles:        slices.Clone(req.Roles),
-			Limit:        depth,
-		},
-		facts: FactQuery{
-			Scope:         req.Scope,
-			AsOf:          asOf,
-			At:            factsAt,
-			Subjects:      slices.Clone(req.Subjects),
-			MinConfidence: req.MinFactConfidence,
-			Text:          req.Query,
-			Limit:         factLimit,
-		},
+	requested := m.resolveChannels(req.Channels)
+	failed := make(map[Channel]ChannelReport, len(requested))
+	var embedded time.Duration
+	for _, channel := range requested {
+		switch channel {
+		case ChannelSemantic:
+			started := time.Now()
+			vector, err := m.embedder.EmbedQuery(ctx, req.Query)
+			embedded = time.Since(started)
+			if err != nil {
+				failed[channel] = ChannelReport{Channel: channel, Duration: embedded,
+					Err: fmt.Errorf("embed query: %w", err)}
+				continue
+			}
+			q.Vector, q.Model = vector, m.embedder.Model()
+		case ChannelFact:
+			if m.facts == nil {
+				failed[channel] = ChannelReport{Channel: channel, Err: fmt.Errorf(
+					"the fact channel needs an Extractor and a FactStore: %w", ErrInvalidConfig)}
+				continue
+			}
+			q.Extractor = m.extractor.Model()
+		}
+		q.Channels = append(q.Channels, channel)
 	}
-	if m.extractor != nil {
-		plan.facts.Extractor = m.extractor.Model()
-	}
-
-	results := m.runChannels(ctx, channels, plan)
-
-	// Cancellation is not a channel failure, and reporting it as one would bury
-	// the reason under a summary.
 	if err := ctx.Err(); err != nil {
 		return Recollection{}, fmt.Errorf("mempher: recall: %w", err)
 	}
-	if err := allFailed(results); err != nil {
+	if len(q.Channels) == 0 {
+		causes := make([]error, 0, len(requested))
+		for _, channel := range requested {
+			causes = append(causes, fmt.Errorf("%s: %w", channel, failed[channel].Err))
+		}
+		return Recollection{}, fmt.Errorf("mempher: recall: %w: %w",
+			ErrAllChannelsFailed, errors.Join(causes...))
+	}
+
+	out, err := m.store.Recall(ctx, q)
+	if err != nil {
 		return Recollection{}, err
 	}
 
-	out := Recollection{
-		Scope:    req.Scope,
-		AsOf:     asOf,
-		Channels: make([]ChannelReport, len(results)),
+	// Report every channel that was asked for, in the order it was asked
+	// for, the ones that never reached the database included.
+	answered := make(map[Channel]ChannelReport, len(out.Channels))
+	for _, report := range out.Channels {
+		answered[report.Channel] = report
 	}
-	for i, r := range results {
-		out.Channels[i] = ChannelReport{
-			Channel:    r.channel,
-			Candidates: len(r.candidates) + len(r.facts),
-			Duration:   r.elapsed,
-			Err:        r.err,
+	out.Channels = make([]ChannelReport, 0, len(requested))
+	for _, channel := range requested {
+		report, ok := answered[channel]
+		if !ok {
+			report = failed[channel]
 		}
-	}
-
-	// Facts take the budget first. They are the compact, current summary of
-	// the scope, so trading one away for another line of transcript is a bad
-	// deal at any budget.
-	for _, r := range results {
-		for _, fact := range r.facts {
-			if len(out.Facts) >= factLimit {
-				out.Truncated = true
-				break
-			}
-			cost := m.tokens.CountTokens(fact.Statement)
-			if req.MaxTokens > 0 && out.Tokens+cost > req.MaxTokens {
-				out.Truncated = true
-				break
-			}
-			out.Facts = append(out.Facts, RecalledFact{Fact: fact, Tokens: cost})
-			out.Tokens += cost
+		if channel == ChannelSemantic && report.Err == nil {
+			report.Duration += embedded
 		}
+		out.Channels = append(out.Channels, report)
 	}
 
-	for _, recalled := range fuse(results, m.fusion) {
-		if len(out.Episodes) >= limit {
-			out.Truncated = true
-			break
-		}
-		cost := m.tokens.CountTokens(recalled.Episode.Content)
-		if req.MaxTokens > 0 && out.Tokens+cost > req.MaxTokens {
-			out.Truncated = true
-			break
-		}
-		recalled.Tokens = cost
-		out.Episodes = append(out.Episodes, recalled)
-		out.Tokens += cost
+	if !counterInSQL {
+		m.budget(&out, req.MaxTokens)
 	}
 	return out, nil
 }
 
-// runChannels runs every requested channel at once, each writing to a slot of
-// its own so that the order results arrive in cannot affect the fused order.
-func (m *Memory) runChannels(
-	ctx context.Context,
-	channels []Channel,
-	plan recallPlan,
-) []channelResult {
-	results := make([]channelResult, len(channels))
-	var wg sync.WaitGroup
-
-	for i, channel := range channels {
-		wg.Add(1)
-		go func() {
-			defer wg.Done()
-			// Wall-clock, deliberately: this measures how long the work took,
-			// which a logical test Clock would report as zero.
-			started := time.Now()
-			candidates, facts, err := m.runChannel(ctx, channel, plan)
-			results[i] = channelResult{
-				channel:    channel,
-				candidates: candidates,
-				facts:      facts,
-				elapsed:    time.Since(started),
-				err:        err,
-			}
-		}()
-	}
-	wg.Wait()
-	return results
-}
-
-// recallPlan is everything the channels need, resolved once before the fan-out
-// so that every channel sees exactly the same cuts. Two channels resolving "now"
-// a millisecond apart would make a result that cannot be replayed.
-type recallPlan struct {
-	episodes ChannelQuery
-	facts    FactQuery
-	text     string
-}
-
-// runChannel is one channel's whole job, embedding included.
-//
-// The query is embedded here rather than before the fan-out, so a slow or
-// unreachable embedder delays only the channel that needs it. The lexical
-// channel answers at full speed either way.
-func (m *Memory) runChannel(
-	ctx context.Context,
-	channel Channel,
-	plan recallPlan,
-) ([]Candidate, []Fact, error) {
-	switch channel {
-	case ChannelSemantic:
-		vector, err := m.embedder.EmbedQuery(ctx, plan.text)
-		if err != nil {
-			return nil, nil, fmt.Errorf("embed query: %w", err)
+// budget counts tokens with the configured [TokenCounter] and spends maxTokens
+// as the database would: facts first, then episodes in order, each list cut at
+// the first entry that does not fit. Zero means no budget.
+func (m *Memory) budget(out *Recollection, maxTokens int) {
+	out.Tokens = 0
+	facts := out.Facts[:0]
+	for _, fact := range out.Facts {
+		cost := m.tokens.CountTokens(fact.Fact.Statement)
+		if maxTokens > 0 && out.Tokens+cost > maxTokens {
+			out.Truncated = true
+			break
 		}
-		candidates, err := m.store.SearchSemantic(ctx, SemanticQuery{
-			ChannelQuery: plan.episodes,
-			Vector:       vector,
-			Model:        m.embedder.Model(),
-		})
-		return candidates, nil, err
-	case ChannelLexical:
-		candidates, err := m.store.SearchLexical(ctx,
-			LexicalQuery{ChannelQuery: plan.episodes, Text: plan.text})
-		return candidates, nil, err
-	case ChannelFact:
-		// Asked for explicitly on a Memory with no Extractor. Reported as this
-		// channel failing, like any other channel that cannot answer, so the
-		// rest of the result still arrives and the reason is in
-		// [Recollection.Channels] rather than swallowed.
-		if m.facts == nil {
-			return nil, nil, fmt.Errorf(
-				"the fact channel needs an Extractor and a FactStore: %w", ErrInvalidConfig)
-		}
-		facts, err := m.facts.Facts(ctx, plan.facts)
-		return nil, facts, err
-	default:
-		return nil, nil, fmt.Errorf("mempher: channel %q: %w", channel, ErrInvalidChannel)
+		fact.Tokens = cost
+		facts = append(facts, fact)
+		out.Tokens += cost
 	}
+	out.Facts = facts
+	episodes := out.Episodes[:0]
+	for _, episode := range out.Episodes {
+		cost := m.tokens.CountTokens(episode.Episode.Content)
+		if maxTokens > 0 && out.Tokens+cost > maxTokens {
+			out.Truncated = true
+			break
+		}
+		episode.Tokens = cost
+		episodes = append(episodes, episode)
+		out.Tokens += cost
+	}
+	out.Episodes = episodes
 }
 
 // resolveChannels returns the channels to run, in a stable order and without
@@ -481,23 +423,6 @@ func (m *Memory) resolveChannels(requested []Channel) []Channel {
 		}
 	}
 	return out
-}
-
-// allFailed reports [ErrAllChannelsFailed] when nothing answered, so an empty
-// memory is never mistaken for a broken one. Every underlying cause is joined
-// in, because the first is rarely the interesting one.
-func allFailed(results []channelResult) error {
-	causes := make([]error, 0, len(results))
-	for _, r := range results {
-		if r.err == nil {
-			return nil
-		}
-		causes = append(causes, fmt.Errorf("%s: %w", r.channel, r.err))
-	}
-	if len(causes) == 0 {
-		return nil
-	}
-	return fmt.Errorf("mempher: recall: %w: %w", ErrAllChannelsFailed, errors.Join(causes...))
 }
 
 // jobsFor is the deferred work one new episode implies. A [Store] fills in the
