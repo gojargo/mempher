@@ -75,8 +75,17 @@ the other names it goes by.
     the new name, and the name it is another name for. "My sister Anna is
     visiting" makes "Anna" an alias of "the user's sister". "I'm Alice" makes
     "Alice" an alias of "the user".
-  - Declare an alias only when the text says so or leaves no doubt. Two people
-    who share a first name are not one person, and an alias cannot be undone.
+  - Declare an alias only when the text says that the two names are the same
+    person or thing, or leaves no doubt of it. An alias cannot be undone, and
+    most answers declare none.
+  - Never join two different people. Two people talking to each other are two
+    people. Someone a person mentions -- a partner, a neighbour, a sister, a
+    friend -- is not that person: "Deborah's neighbour" is not Deborah, and is
+    not anyone else who has been named unless the text says who it is. Two
+    people who share a first name are not one person.
+  - Give each alias a confidence between 0 and 1. Use 1.0 only when the text
+    states the identity outright. An alias you are less than sure of is one to
+    leave out.
   - A known fact about any of a thing's names is a fact about that thing. If an
     episode about Anna contradicts a known fact about the user's sister,
     retract it.

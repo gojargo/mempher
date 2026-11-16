@@ -125,7 +125,7 @@ SELECT * FROM mempher.append('user:8123',
 SELECT mempher.recall('user:8123', 'any food allergies?',
   p_embedding  := $1,
   p_model      := 'text-embedding-3-small',
-  p_extractor  := 'mempher-extract/v2+claude-opus-5+a3f9c1e2',
+  p_extractor  := 'mempher-extract/v3+claude-opus-5+a3f9c1e2',
   p_max_tokens := 2000);
 
 -- Erase a user, with everything derived from their episodes.

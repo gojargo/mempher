@@ -64,6 +64,9 @@ type jsonRetraction struct {
 type jsonAlias struct {
 	Alias string `json:"alias"`
 	Of    string `json:"of"`
+	// A pointer for the reason an assertion's is: an alias with no
+	// confidence is one the model did not vouch for, and is dropped.
+	Confidence *float64 `json:"confidence"`
 }
 
 // decode reads a provider's reply. Unknown fields are tolerated: a provider that
@@ -97,15 +100,111 @@ func (e *Extractor) validate(
 	if body.Retractions != nil {
 		retractions = *body.Retractions
 	}
+	retract := e.retractions(ctx, retractions, req)
 	return mempher.ExtractResult{
-		Assert:  e.assertions(ctx, assertions, req.Now),
-		Retract: e.retractions(ctx, retractions, req),
+		Assert:  e.unsettled(ctx, e.assertions(ctx, assertions, req.Now), retract, req),
+		Retract: retract,
 		Alias:   e.aliases(ctx, body.Aliases),
 	}
 }
 
-// aliases keeps the declarations a FactStore would accept. One that names a
-// thing after itself says nothing and is dropped without a log line.
+// unsettled drops the assertions that restate a claim over a window that
+// overlaps without matching: one already known, or one made earlier in the same
+// answer.
+//
+// A model shown "lives in Paris since 2019" and an episode that mentions Paris
+// again tends to assert it once more, dated from the mention. A FactStore
+// refuses that as a conflict, rightly: it will not guess which window is true.
+// But refusing it there fails the whole extraction, every retry of it, and the
+// good claims beside it. The prompt already says a restated fact is recorded
+// and needs nothing, so the restatement is what goes, and the window the scope
+// already believes stands.
+//
+// It can only see the facts the worker supplied. A conflict with a fact outside
+// them still reaches the store and is still an error.
+func (e *Extractor) unsettled(
+	ctx context.Context,
+	in []mempher.Assertion,
+	retract []mempher.Retraction,
+	req mempher.ExtractRequest,
+) []mempher.Assertion {
+	if len(in) == 0 {
+		return in
+	}
+	// A fact this same answer closes is compared as it will stand once
+	// closed: "moved away in June, and back the next year" asserts a window
+	// that overlaps the old one only until the retraction is applied.
+	closed := make(map[mempher.FactID]time.Time, len(retract))
+	for _, r := range retract {
+		closed[r.Fact] = r.At
+	}
+	// Any name an entity goes by is that entity, and the known facts carry
+	// its own name.
+	names := map[string]string{}
+	for _, entity := range req.Entities {
+		for _, alias := range entity.Aliases {
+			names[nameKey(string(alias))] = nameKey(string(entity.Name))
+		}
+	}
+	subject := func(s mempher.Subject) string {
+		key := nameKey(string(s))
+		if name, ok := names[key]; ok {
+			return name
+		}
+		return key
+	}
+	type claim struct{ subject, predicate, object string }
+	known := make(map[claim][]mempher.Validity, len(req.Known))
+	for _, f := range req.Known {
+		window := f.Valid
+		if at, ok := closed[f.ID]; ok && (window.IsOpen() || at.Before(window.To)) {
+			window.To = at
+		}
+		c := claim{subject(f.Subject), string(f.Predicate), f.Object}
+		known[c] = append(known[c], window)
+	}
+
+	clashes := func(windows []mempher.Validity, with mempher.Validity) bool {
+		for _, window := range windows {
+			same := window.From.Equal(with.From) && window.To.Equal(with.To)
+			if !same && window.Overlaps(with) {
+				return true
+			}
+		}
+		return false
+	}
+
+	// The same holds within one answer: a model that gives one claim two
+	// overlapping windows has contradicted itself, the store refuses the
+	// whole extraction for it, and the first window it gave is the one kept.
+	out := in[:0:0]
+	kept := make(map[claim][]mempher.Validity, len(in))
+	for _, a := range in {
+		c := claim{subject(a.Subject), string(a.Predicate), a.Object}
+		switch {
+		case clashes(known[c], a.Valid):
+			e.log.InfoContext(ctx, "mempher/extract: dropped an assertion that restates a known fact",
+				"subject", a.Subject, "predicate", a.Predicate, "object", a.Object)
+		case clashes(kept[c], a.Valid):
+			e.log.WarnContext(ctx, "mempher/extract: dropped an assertion that contradicts an earlier one",
+				"subject", a.Subject, "predicate", a.Predicate, "object", a.Object)
+		default:
+			kept[c] = append(kept[c], a.Valid)
+			out = append(out, a)
+		}
+	}
+	return out
+}
+
+// nameKey is the form in which two spellings of a name are one name, as the
+// store compares them: case and runs of whitespace aside.
+func nameKey(s string) string {
+	return strings.ToLower(strings.Join(strings.Fields(s), " "))
+}
+
+// aliases keeps the declarations a FactStore would accept and the model was
+// sure of. One that names a thing after itself says nothing and is dropped
+// without a log line.
 func (e *Extractor) aliases(ctx context.Context, in []jsonAlias) []mempher.Alias {
 	if len(in) == 0 {
 		return nil
@@ -122,6 +221,11 @@ func (e *Extractor) aliases(ctx context.Context, in []jsonAlias) []mempher.Alias
 			Of:   mempher.Subject(strings.TrimSpace(raw.Of)),
 		}
 		if strings.EqualFold(string(a.Name), string(a.Of)) {
+			continue
+		}
+		if raw.Confidence == nil || *raw.Confidence < e.opts.MinAliasConfidence {
+			e.log.InfoContext(ctx, "mempher/extract: dropped an alias the model was not sure of",
+				"alias", raw.Alias, "of", raw.Of, "threshold", e.opts.MinAliasConfidence)
 			continue
 		}
 		if err := a.Validate(); err != nil {

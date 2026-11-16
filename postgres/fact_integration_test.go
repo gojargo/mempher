@@ -205,13 +205,15 @@ func TestApplyExtractionSupersedes(t *testing.T) {
 	}
 }
 
-// TestApplyExtractionRejectsOverlap is the database refusing to believe one
-// claim over two windows at once.
-func TestApplyExtractionRejectsOverlap(t *testing.T) {
+// TestApplyExtractionKeepsTheWindowOfARestatedClaim: a claim the scope already
+// holds, asserted again from another date, is a restatement and not a second
+// fact. The window believed stands, the fact gains the new episode as
+// provenance, and the claims beside it are still written.
+func TestApplyExtractionKeepsTheWindowOfARestatedClaim(t *testing.T) {
 	t.Parallel()
 	store, _ := migrated(t)
 	first := seedEpisode(t, store, "user:1", "I live in Paris")
-	second := seedEpisode(t, store, "user:1", "still in Paris")
+	second := seedEpisode(t, store, "user:1", "still in Paris, and I took up chess")
 
 	if _, err := store.ApplyExtraction(t.Context(), mempher.ExtractCommand{
 		Scope: "user:1", Extractor: testExtractor,
@@ -222,16 +224,32 @@ func TestApplyExtractionRejectsOverlap(t *testing.T) {
 		t.Fatalf("assert Paris: %v", err)
 	}
 
-	// The same claim over a window that overlaps the first, from episodes that
-	// have not been read: a real contradiction, not a replay.
-	_, err := store.ApplyExtraction(t.Context(), mempher.ExtractCommand{
+	chess := lives("Paris", mempher.Validity{From: y2023})
+	chess.Predicate, chess.Object, chess.Statement = "plays", "chess", "the user plays chess"
+	if _, err := store.ApplyExtraction(t.Context(), mempher.ExtractCommand{
 		Scope: "user:1", Extractor: testExtractor,
 		Episodes: []mempher.EpisodeID{second},
-		Assert:   []mempher.Assertion{lives("Paris", mempher.Validity{From: y2023})},
+		Assert:   []mempher.Assertion{lives("Paris", mempher.Validity{From: y2023}), chess},
 		At:       epoch.Add(time.Hour),
-	})
-	if !errors.Is(err, mempher.ErrFactConflict) {
-		t.Fatalf("err = %v, want ErrFactConflict", err)
+	}); err != nil {
+		t.Fatalf("restate Paris: %v", err)
+	}
+
+	facts := currentFacts(t, store, "user:1")
+	if len(facts) != 2 {
+		t.Fatalf("got %d facts, want Paris once and chess", len(facts))
+	}
+	for _, f := range facts {
+		switch f.Predicate {
+		case "lives_in":
+			if !f.Valid.From.Equal(y2019) || len(f.Episodes) != 2 {
+				t.Errorf("Paris holds from %s on %d episodes, want from 2019 on both", f.Valid.From, len(f.Episodes))
+			}
+		case "plays":
+			if len(f.Episodes) != 1 {
+				t.Errorf("chess is supported by %d episodes, want 1", len(f.Episodes))
+			}
+		}
 	}
 }
 

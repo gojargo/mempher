@@ -225,8 +225,9 @@ type ExtractResult struct {
 // lease replays a job, and while the [FactStore] declines to apply an extraction
 // of episodes it has already read, a model that answers differently the first
 // time it sees a scope and the first time it re-derives one during a backfill
-// will assert the same claim over a window that overlaps the old one, which is
-// [ErrFactConflict] rather than a silently merged answer.
+// will assert the same claim over a window that overlaps the old one. The store
+// keeps the window it had, so the two answers do not conflict, but which of
+// them is kept then depends on which arrived first.
 type Extractor interface {
 	// Extract reads the episodes and returns what to assert and retract.
 	Extract(ctx context.Context, req ExtractRequest) (ExtractResult, error)

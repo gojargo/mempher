@@ -51,10 +51,11 @@ var (
 	// ErrEmbedderMismatch means the configured [Embedder] disagrees with what
 	// the database was migrated for.
 	ErrEmbedderMismatch = errors.New("embedder does not match schema")
-	// ErrFactConflict means an assertion overlapped an existing fact for the
-	// same scope, extractor, subject, predicate and object over a window it
-	// contradicts. It is reported rather than resolved: silently widening one
-	// of the two windows would lose the disagreement that caused it.
+	// ErrFactConflict means one extraction asserted the same claim over two
+	// windows that overlap without matching. It is reported rather than
+	// resolved: picking one of the two would lose the disagreement. A claim
+	// that overlaps a fact already stored is not this error: the stored
+	// window stands and the fact gains the new episodes as provenance.
 	ErrFactConflict = errors.New("fact validity windows conflict")
 	// ErrInvalidEntity means a name an entity was to go by -- in an [Alias],
 	// a [MergeCommand] or a [RelatedQuery] -- was empty, too long or held a

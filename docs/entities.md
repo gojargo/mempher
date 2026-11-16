@@ -61,8 +61,17 @@ An operator can declare one directly:
 SELECT mempher.merge_entities('user:8123', 'my-extractor', 'Anna', 'the user''s sister');
 ```
 
-If the alias is a new name, it is added. If it already names a different
-entity, that entity is merged into the other:
+An alias declared by an extraction is applied cautiously, because a model can
+take two people for one and a merge cannot be undone:
+
+- a new name is added to the entity,
+- if only one of the two names has facts, that entity stands and takes the
+  other name,
+- if both names already have facts, the alias is ignored.
+
+`merge_entities` is the deliberate version and always merges. If the alias is
+a new name, it is added. If it already names a different entity, that entity
+is merged into the other:
 
 - its names move to the surviving entity,
 - its facts are rewritten to the surviving subject,
@@ -73,7 +82,9 @@ Declaring the same alias twice changes nothing. There is no unmerge. A wrong
 merge is repaired like any wrong extraction: rebuild L1 from the log.
 
 The shipped extractor (`mempher/extract`) shows the model the names already
-known and asks it to declare an alias only when the text says so.
+known, asks it to declare an alias only when the text says so, and keeps an
+alias only if the model gives it a confidence of at least 0.9
+(`Options.MinAliasConfidence`).
 
 ## Reading
 

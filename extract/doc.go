@@ -22,7 +22,7 @@
 // asserted: the prompt revision shipped here, the provider model, and a digest
 // of [Options].
 //
-//	mempher-extract/v2+claude-opus-5+a3f9c1e2
+//	mempher-extract/v3+claude-opus-5+a3f9c1e2
 //
 // So editing [Options.Instructions] makes a different extractor, and the facts
 // the old one asserted stay under the old id until a backfill re-derives the
