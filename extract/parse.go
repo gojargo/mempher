@@ -25,6 +25,9 @@ import (
 type extraction struct {
 	Assertions  *[]jsonAssertion  `json:"assertions"`
 	Retractions *[]jsonRetraction `json:"retractions"`
+	// Not part of answered: a reply holding only aliases has still missed
+	// the two fields every reply must carry.
+	Aliases []jsonAlias `json:"aliases"`
 }
 
 // answered reports that the reply was in the shape asked for, whether or not it
@@ -56,6 +59,11 @@ type jsonAssertion struct {
 type jsonRetraction struct {
 	FactID string `json:"fact_id"`
 	At     string `json:"at"`
+}
+
+type jsonAlias struct {
+	Alias string `json:"alias"`
+	Of    string `json:"of"`
 }
 
 // decode reads a provider's reply. Unknown fields are tolerated: a provider that
@@ -92,7 +100,38 @@ func (e *Extractor) validate(
 	return mempher.ExtractResult{
 		Assert:  e.assertions(ctx, assertions, req.Now),
 		Retract: e.retractions(ctx, retractions, req),
+		Alias:   e.aliases(ctx, body.Aliases),
 	}
+}
+
+// aliases keeps the declarations a FactStore would accept. One that names a
+// thing after itself says nothing and is dropped without a log line.
+func (e *Extractor) aliases(ctx context.Context, in []jsonAlias) []mempher.Alias {
+	if len(in) == 0 {
+		return nil
+	}
+	out := make([]mempher.Alias, 0, len(in))
+	for _, raw := range in {
+		if len(out) >= mempher.MaxAliasesPerExtraction {
+			e.log.WarnContext(ctx, "mempher/extract: aliases over the cap were dropped",
+				"cap", mempher.MaxAliasesPerExtraction, "returned", len(in))
+			break
+		}
+		a := mempher.Alias{
+			Name: mempher.Subject(strings.TrimSpace(raw.Alias)),
+			Of:   mempher.Subject(strings.TrimSpace(raw.Of)),
+		}
+		if strings.EqualFold(string(a.Name), string(a.Of)) {
+			continue
+		}
+		if err := a.Validate(); err != nil {
+			e.log.WarnContext(ctx, "mempher/extract: dropped an alias",
+				"reason", err, "alias", raw.Alias, "of", raw.Of)
+			continue
+		}
+		out = append(out, a)
+	}
+	return out
 }
 
 func (e *Extractor) assertions(

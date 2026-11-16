@@ -29,6 +29,7 @@ var apiErrors = map[string]error{
 	"MP011": mempher.ErrInvalidValidity,
 	"MP012": mempher.ErrInvalidExtraction,
 	"MP013": mempher.ErrInvalidConfig,
+	"MP014": mempher.ErrInvalidEntity,
 	"MP020": mempher.ErrNotFound,
 	"MP021": mempher.ErrDimensionMismatch,
 	"MP022": mempher.ErrFactConflict,

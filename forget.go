@@ -53,6 +53,10 @@ type ForgetResult struct {
 	// Facts is how many facts were removed because an episode they were read
 	// from is gone.
 	Facts int
+	// Entities is how many entities went: every one in a whole-scope
+	// erasure, and otherwise those the erased episodes introduced that no
+	// remaining fact is about.
+	Entities int
 	// Extractions is how many extraction markers went, which is what stops a
 	// worker from re-reading an episode that no longer exists.
 	Extractions int

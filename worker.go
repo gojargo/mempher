@@ -466,22 +466,39 @@ func (w *Worker) extract(ctx context.Context, job Job) error {
 	// orders by subject and predicate, so a scope holding more than
 	// KnownFactLimit facts shows an extractor the alphabetically first ones --
 	// and a claim an extractor is not shown is a claim it cannot supersede.
+	cue := knownFactCue(episodes)
 	known, err := w.facts.Facts(ctx, FactQuery{
 		Scope:     job.Scope,
 		Extractor: w.extractor.Model(),
 		AsOf:      latest.IngestedAt,
 		At:        latest.OccurredAt,
-		Text:      knownFactCue(episodes),
+		Text:      cue,
 		Limit:     w.known,
 	})
 	if err != nil {
 		return fmt.Errorf("read the scope's known facts: %w", err)
 	}
 
+	// Who the episodes are talking about, under every name each goes by: an
+	// extractor that reads "Anna" has to be able to tell that a known fact
+	// about "the user's sister" is about her. The same system-time cut as the
+	// facts, for the same reason.
+	entities, err := w.facts.Entities(ctx, EntityQuery{
+		Scope:       job.Scope,
+		Extractor:   w.extractor.Model(),
+		MentionedIn: cue,
+		AsOf:        latest.IngestedAt,
+		Limit:       w.known,
+	})
+	if err != nil {
+		return fmt.Errorf("read the entities the episodes name: %w", err)
+	}
+
 	result, err := w.extractor.Extract(ctx, ExtractRequest{
 		Scope:    job.Scope,
 		Episodes: episodes,
 		Known:    known,
+		Entities: entities,
 		Now:      w.clock.Now(),
 	})
 	if err != nil {
@@ -494,6 +511,7 @@ func (w *Worker) extract(ctx context.Context, job Job) error {
 		Episodes:  job.Episodes,
 		Assert:    result.Assert,
 		Retract:   result.Retract,
+		Alias:     result.Alias,
 		At:        w.clock.Now(),
 	}); err != nil {
 		return fmt.Errorf("apply an extraction of %d episodes: %w", len(episodes), err)

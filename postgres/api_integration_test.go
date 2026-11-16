@@ -826,3 +826,230 @@ func TestSQLForget(t *testing.T) {
 		}
 	})
 }
+
+func TestSQLEntities(t *testing.T) {
+	t.Parallel()
+	_, pool := migrated(t)
+	ctx := t.Context()
+
+	// seed appends one episode to a scope and applies an extraction of it.
+	seed := func(t *testing.T, scope, assert, aliases string) error {
+		t.Helper()
+		var episode string
+		if err := pool.QueryRow(ctx, `
+			SELECT id::text FROM mempher.append($1, '[{"content":"c","role":"user","source":"s"}]',
+			                                    '2026-01-01T00:00:00Z')`, scope).Scan(&episode); err != nil {
+			t.Fatalf("append: %v", err)
+		}
+		return exec(t, pool, `
+			SELECT count(*) FROM mempher.apply_extraction($1, 'x/v1', ARRAY[$2::uuid], $3::jsonb, '[]',
+			                                              '2026-01-02', p_aliases := $4::jsonb)`,
+			scope, episode, assert, aliases)
+	}
+	must := func(t *testing.T, err error) {
+		t.Helper()
+		if err != nil {
+			t.Fatal(err)
+		}
+	}
+	fact := func(subject, predicate, object, from string) string {
+		raw, err := json.Marshal(map[string]string{
+			"subject": subject, "predicate": predicate, "object": object,
+			"statement": subject + " " + predicate + " " + object, "valid_from": from,
+		})
+		if err != nil {
+			t.Fatalf("marshal: %v", err)
+		}
+		return string(raw)
+	}
+	strs := func(t *testing.T, sql string, args ...any) []string {
+		t.Helper()
+		rows, err := pool.Query(ctx, sql, args...)
+		if err != nil {
+			t.Fatalf("query: %v", err)
+		}
+		defer rows.Close()
+		var out []string
+		for rows.Next() {
+			var s string
+			if err := rows.Scan(&s); err != nil {
+				t.Fatalf("scan: %v", err)
+			}
+			out = append(out, s)
+		}
+		if err := rows.Err(); err != nil {
+			t.Fatalf("rows: %v", err)
+		}
+		return out
+	}
+	subjects := func(t *testing.T, scope string) []string {
+		t.Helper()
+		return strs(t, `SELECT subject || ' ' || predicate || ' ' || object FROM mempher.facts
+		                WHERE scope_id = $1 ORDER BY 1`, scope)
+	}
+
+	t.Run("a subject is stored under the first spelling of its name", func(t *testing.T) {
+		must(t, seed(t, "e:case", "["+fact("the user", "likes", "tea", "2026-01-01")+"]", `[]`))
+		must(t, seed(t, "e:case", "["+fact("The  User", "likes", "jazz", "2026-01-01")+"]", `[]`))
+		got := subjects(t, "e:case")
+		if !slices.Equal(got, []string{"the user likes jazz", "the user likes tea"}) {
+			t.Errorf("facts = %q, want both under \"the user\"", got)
+		}
+		if n := strs(t, `SELECT name FROM mempher.list_entities('e:case', 'x/v1')`); !slices.Equal(n, []string{"the user"}) {
+			t.Errorf("entities = %q, want one", n)
+		}
+	})
+
+	t.Run("an alias makes two names one subject, for writing and for reading", func(t *testing.T) {
+		must(t, seed(t, "e:alias", "["+fact("the user's sister", "lives_in", "Paris", "2026-01-01")+"]", `[]`))
+		must(t, seed(t, "e:alias", "["+fact("Anna", "plays", "cello", "2026-01-01")+"]",
+			`[{"alias":"Anna","of":"the user's sister"}]`))
+		got := subjects(t, "e:alias")
+		want := []string{"the user's sister lives_in Paris", "the user's sister plays cello"}
+		if !slices.Equal(got, want) {
+			t.Fatalf("facts = %q, want %q", got, want)
+		}
+		aliases := strs(t, `SELECT array_to_string(aliases, ',') FROM mempher.list_entities('e:alias', 'x/v1')`)
+		if !slices.Equal(aliases, []string{"Anna"}) {
+			t.Errorf("aliases = %q, want Anna on the one entity", aliases)
+		}
+		bySubject := strs(t, `SELECT object FROM mempher.search_facts('e:alias', 'x/v1', '2026-06-01', '2026-06-01',
+			p_subjects := ARRAY['ANNA'])`)
+		slices.Sort(bySubject)
+		if !slices.Equal(bySubject, []string{"Paris", "cello"}) {
+			t.Errorf("facts about ANNA = %q, want both of her sister's", bySubject)
+		}
+		mentioned := strs(t, `SELECT name FROM mempher.list_entities('e:alias', 'x/v1', 'Is anna, by any chance, in town?')`)
+		if !slices.Equal(mentioned, []string{"the user's sister"}) {
+			t.Errorf("mentioned = %q, want the sister", mentioned)
+		}
+		other := strs(t, `SELECT name FROM mempher.list_entities('e:alias', 'x/v1', 'Is Hanna in town?')`)
+		if len(other) != 0 {
+			t.Errorf("Hanna names %q, want nobody", other)
+		}
+	})
+
+	t.Run("the same claim under two names of one entity is one fact", func(t *testing.T) {
+		must(t, seed(t, "e:same", "["+fact("my sister", "lives_in", "Paris", "2026-01-01")+"]", `[]`))
+		must(t, seed(t, "e:same", "["+fact("Anna", "lives_in", "Paris", "2026-01-01")+"]",
+			`[{"alias":"Anna","of":"my sister"}]`))
+		var facts, episodes int
+		must(t, pool.QueryRow(ctx, `SELECT count(*), max(cardinality(episode_ids)) FROM mempher.facts
+		                           WHERE scope_id = 'e:same'`).Scan(&facts, &episodes))
+		if facts != 1 || episodes != 2 {
+			t.Errorf("%d facts, supported by up to %d episodes; want one fact supported by both", facts, episodes)
+		}
+	})
+
+	t.Run("merging two entities moves the facts, and the surviving one's claim stands", func(t *testing.T) {
+		must(t, seed(t, "e:merge", "["+fact("my sister", "lives_in", "Paris", "2020-01-01")+"]", `[]`))
+		must(t, seed(t, "e:merge", "["+fact("Anna", "lives_in", "Paris", "2024-01-01")+","+
+			fact("Anna", "plays", "cello", "2024-01-01")+"]", `[]`))
+		var first, second string
+		must(t, pool.QueryRow(ctx, `SELECT mempher.merge_entities('e:merge', 'x/v1', 'Anna', 'my sister', '2026-02-01')::text`).Scan(&first))
+		must(t, pool.QueryRow(ctx, `SELECT mempher.merge_entities('e:merge', 'x/v1', 'anna', 'My Sister', '2026-02-02')::text`).Scan(&second))
+		if first != second {
+			t.Errorf("the second merge returned %s, the first %s", second, first)
+		}
+		got := strs(t, `SELECT subject || ' ' || predicate || ' ' || object || ' ' || lower(valid)::date
+		                       || ' ' || cardinality(episode_ids)
+		                FROM mempher.facts WHERE scope_id = 'e:merge' ORDER BY 1`)
+		want := []string{"my sister lives_in Paris 2020-01-01 2", "my sister plays cello 2024-01-01 1"}
+		if !slices.Equal(got, want) {
+			t.Errorf("facts = %q, want %q", got, want)
+		}
+		if n := strs(t, `SELECT name FROM mempher.list_entities('e:merge', 'x/v1')`); !slices.Equal(n, []string{"my sister"}) {
+			t.Errorf("entities = %q, want only the one merged into", n)
+		}
+	})
+
+	t.Run("related_facts walks the facts that tie entities together", func(t *testing.T) {
+		must(t, seed(t, "e:graph", "["+
+			fact("the user", "sister", "Anna", "2026-01-01")+","+
+			fact("the user", "likes", "tea", "2026-01-01")+","+
+			fact("Anna", "works_at", "Acme", "2026-01-01")+","+
+			fact("Acme", "based_in", "Lyon", "2026-01-01")+","+
+			fact("Bob", "likes", "chess", "2026-01-01")+"]", `[]`))
+		walk := func(hops int) []string {
+			return strs(t, `SELECT hops || ' ' || subject || ' ' || predicate FROM mempher.related_facts(
+				'e:graph', 'x/v1', ARRAY['acme'], $1, '2026-06-01', '2026-06-01')`, hops)
+		}
+		if got, want := walk(0), []string{"0 Acme based_in", "0 Anna works_at"}; !slices.Equal(got, want) {
+			t.Errorf("0 hops = %q, want %q", got, want)
+		}
+		if got, want := walk(1), []string{"0 Acme based_in", "0 Anna works_at", "1 the user sister"}; !slices.Equal(got, want) {
+			t.Errorf("1 hop = %q, want %q", got, want)
+		}
+		want := []string{"0 Acme based_in", "0 Anna works_at", "1 the user sister", "2 the user likes"}
+		if got := walk(8); !slices.Equal(got, want) {
+			t.Errorf("8 hops = %q, want %q (and never Bob)", got, want)
+		}
+		before := strs(t, `SELECT subject FROM mempher.related_facts('e:graph', 'x/v1', ARRAY['Acme'], 2, '2025-01-01', '2026-06-01')`)
+		if len(before) != 0 {
+			t.Errorf("before any of it was true: %q, want nothing", before)
+		}
+	})
+
+	t.Run("a question that names an entity ranks its facts first", func(t *testing.T) {
+		must(t, seed(t, "e:rank", "["+
+			fact("the user", "likes", "tea", "2026-01-01")+","+
+			fact("the user", "owns", "bike", "2026-01-01")+","+
+			fact("the user's sister", "plays", "cello", "2026-01-01")+"]",
+			`[{"alias":"Anna","of":"the user's sister"}]`))
+		got := strs(t, `SELECT subject FROM mempher.search_facts('e:rank', 'x/v1', '2026-06-01', '2026-06-01',
+			'what about Anna?', 1)`)
+		if !slices.Equal(got, []string{"the user's sister"}) {
+			t.Errorf("first fact for a question about Anna is about %q", got)
+		}
+		all := strs(t, `SELECT subject FROM mempher.search_facts('e:rank', 'x/v1', '2026-06-01', '2026-06-01', 'what about Anna?')`)
+		if len(all) != 3 {
+			t.Errorf("%d facts, want all 3: naming an entity ranks, it does not filter", len(all))
+		}
+	})
+
+	t.Run("forget takes the names with the episodes that gave them", func(t *testing.T) {
+		must(t, seed(t, "e:forget", "["+fact("the user", "likes", "tea", "2026-01-01")+"]", `[]`))
+		must(t, seed(t, "e:forget", "["+fact("Bob", "likes", "chess", "2026-01-01")+"]",
+			`[{"alias":"Alice","of":"the user"}]`))
+		var entities int
+		must(t, pool.QueryRow(ctx, `
+			SELECT entities FROM mempher.forget('e:forget',
+				(SELECT array_agg(id) FROM mempher.episodes WHERE scope_id = 'e:forget' AND seq = 2))`).Scan(&entities))
+		if entities != 1 {
+			t.Errorf("forget removed %d entities, want Bob alone", entities)
+		}
+		left := strs(t, `SELECT alias FROM mempher.entity_aliases WHERE scope_id = 'e:forget'`)
+		if !slices.Equal(left, []string{"the user"}) {
+			t.Errorf("names left = %q, want only \"the user\"", left)
+		}
+		must(t, pool.QueryRow(ctx, `SELECT entities FROM mempher.forget('e:forget')`).Scan(&entities))
+		var rows int
+		must(t, pool.QueryRow(ctx, `SELECT count(*) FROM mempher.entities WHERE scope_id = 'e:forget'`).Scan(&rows))
+		if entities != 1 || rows != 0 {
+			t.Errorf("erasing the scope removed %d entities and left %d, want 1 and 0", entities, rows)
+		}
+	})
+
+	t.Run("rejects", func(t *testing.T) {
+		must(t, seed(t, "e:bad", `[]`, `[]`))
+		long := strings.Repeat("a", 201)
+		wantSQLState(t, seed(t, "e:bad", `[]`, `{"alias":"a","of":"b"}`), "MP012")
+		wantSQLState(t, seed(t, "e:bad", `[]`, `[{"alias":"a"}]`), "MP012")
+		wantSQLState(t, seed(t, "e:bad", `[]`, `[{"alias":"a","of":"b","kind":"person"}]`), "MP012")
+		wantSQLState(t, seed(t, "e:bad", `[]`, `[{"alias":"  ","of":"b"}]`), "MP014")
+		wantSQLState(t, seed(t, "e:bad", `[]`, `[{"alias":"a","of":"`+long+`"}]`), "MP014")
+		wantSQLState(t, seed(t, "e:bad", "["+fact("  ", "p", "o", "2026-01-01")+"]", `[]`), "MP010")
+		wantSQLState(t, seed(t, "e:bad", "["+fact("Anna", "p", "o", "2026-01-01")+","+
+			fact("anna", "p", "o", "2026-02-01")+"]", `[]`), "MP022")
+
+		wantSQLState(t, exec(t, pool, `SELECT mempher.merge_entities('e:bad', 'x/v1', '', 'b')`), "MP014")
+		wantSQLState(t, exec(t, pool, `SELECT mempher.merge_entities('e:bad', '', 'a', 'b')`), "MP013")
+		wantSQLState(t, exec(t, pool, `SELECT mempher.merge_entities('e:nowhere', 'x/v1', 'a', 'b')`), "MP020")
+		wantSQLState(t, exec(t, pool, `SELECT mempher.list_entities('e:bad', 'x/v1', p_limit := 0)`), "MP013")
+		wantSQLState(t, exec(t, pool, `SELECT mempher.related_facts('e:bad', 'x/v1', '{}')`), "MP013")
+		wantSQLState(t, exec(t, pool, `SELECT mempher.related_facts('e:bad', 'x/v1', ARRAY['a'], 9)`), "MP013")
+		wantSQLState(t, exec(t, pool, `SELECT mempher.related_facts('e:bad', 'x/v1', ARRAY[''])`), "MP014")
+		wantSQLState(t, exec(t, pool,
+			`SELECT mempher.search_facts('e:bad', 'x/v1', p_weights := '{"entities": 1}')`), "MP013")
+	})
+}
