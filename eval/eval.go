@@ -20,12 +20,23 @@ type Question struct {
 	// broken down by it. A number that is good overall and bad on one category
 	// is the interesting case, and an average hides it.
 	Type string
+	// Scope, when set, names the haystack. Consecutive questions with the
+	// same Scope are asked of one haystack, which [RunQA] ingests once: a
+	// benchmark that asks two hundred questions of one conversation would
+	// otherwise pay for its extraction two hundred times. [Run] and [RunL1]
+	// ignore it and give every question a scope of its own.
+	Scope string
 	// Query is what to recall with.
 	Query string
 	// Answer is what the benchmark expects, when it says. Used by [RunL1],
 	// which has no ranking to score and must fall back on whether the claim
 	// came out at all.
 	Answer string
+	// Grading is what a judge is told about this question beyond the general
+	// rule, in the benchmark's own terms: that an off-by-one day count is
+	// acceptable, that the expected answer is a rubric, that the right answer
+	// is to decline. Used by [RunQA] only.
+	Grading string
 	// Asked is when the question was put. It is recorded rather than applied:
 	// see [Config.BoundByQuestionTime].
 	Asked time.Time
@@ -43,6 +54,10 @@ type Question struct {
 type Dataset struct {
 	// Name identifies it in a [Summary].
 	Name string
+	// Instructions is what an extractor should be told about this corpus,
+	// for [extract.Options.Instructions]: who is speaking, when that is not
+	// an agent and the person it serves. Empty when there is nothing to say.
+	Instructions string
 	// Questions yields one question at a time.
 	//
 	// An iterator rather than a slice because a benchmark haystack runs to

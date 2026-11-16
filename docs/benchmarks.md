@@ -56,8 +56,71 @@ judge is needed. These numbers are not comparable to the end-to-end accuracy
 figures usually quoted for LongMemEval, which mostly measure the model that
 reads the context.
 
-The fact channel and entity resolution are not measured here yet. End-to-end
-question answering numbers are the next item on the roadmap.
+The fact channel and entity resolution are measured end to end below.
 
 Reproduce with `make eval LONGMEMEVAL=/path/to/longmemeval_s`. The harness is
 [`mempher/eval`](https://pkg.go.dev/github.com/gojargo/mempher/eval).
+
+## End-to-end answers
+
+[LoCoMo](https://github.com/snap-research/locomo): 10 long conversations
+between two people, 5,882 turns in all, and 1,540 questions (the adversarial
+category is left out, as is usual). For each question mempher recalls, a model
+writes an answer from what came back, and a second model judges the answer
+against the expected one.
+
+| Recall returns | accuracy | single-hop | temporal | multi-hop | open-domain | context |
+| --- | --- | --- | --- | --- | --- | --- |
+| episodes | 0.644 | 0.753 | 0.642 | 0.390 | 0.438 | 400 tokens |
+| episodes and facts (the default) | 0.686 | 0.803 | 0.664 | 0.426 | 0.510 | 808 tokens |
+| facts | 0.253 | 0.257 | 0.240 | 0.241 | 0.302 | 408 tokens |
+
+Questions per category: 841 single-hop, 321 temporal, 282 multi-hop, 96
+open-domain.
+
+The setup:
+
+| | |
+| --- | --- |
+| Extractor | `mistral-small-latest`, up to 64 assertions per extraction |
+| Embedder | `mistral-embed`, 1024 dimensions |
+| Answers | `mistral-small-latest` |
+| Judge | `mistral-medium-latest` |
+| Recall | 10 episodes, 32 facts, no token budget |
+
+What the run shows:
+
+- Facts add 4 points on top of episodes, for 400 more tokens of context.
+- Facts alone are not enough. The extractor kept 861 facts from 5,882 turns,
+  and 32 of them are returned per question.
+- Retrieval is the larger share of the misses. The labelled evidence came back
+  for 77% of questions. With it, 78% of answers were right; without it, 39%.
+- The context is small. Ten short turns is 400 tokens. A larger limit would
+  raise the evidence rate; it was not measured.
+- Run to run, the same configuration moves by about half a point: an earlier
+  run of the same setup scored 0.638, 0.691 and 0.263.
+
+What the run found, and what was done about it:
+
+- In an earlier run the extractor declared the two speakers of one
+  conversation to be the same entity, and their facts were merged. An alias
+  from an extraction now needs a confidence of 0.9 and never merges two
+  entities that both have facts. In the run above every conversation kept its
+  two speakers apart, and the aliases declared were nicknames (Cal, Deb, Mel,
+  Jo).
+- In that earlier run 7 of 95 extraction jobs died because the model restated
+  a claim the scope already held over a different window. The stored window
+  now stands and the job succeeds.
+- In the run above 4 of 95 extraction jobs still died, because the model gave
+  one claim two overlapping windows in a single answer. Those turns, about 4%,
+  have no facts in these numbers. The extractor now keeps the first window and
+  drops the other; that change is not in the numbers.
+
+These numbers move with the four models above and with the judge's wording.
+They are not comparable to figures published for other systems, which use
+other models and other judge prompts.
+
+Reproduce with `make qa LOCOMO=/path/to/locomo10.json` and the `QA_*`
+variables described in
+[`eval/qa_run_test.go`](../eval/qa_run_test.go). The run takes about an hour
+at 5 requests per second.
