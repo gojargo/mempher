@@ -9,6 +9,7 @@ import (
 	"time"
 
 	"github.com/jackc/pgx/v5/pgxpool"
+
 	"github.com/gojargo/mempher"
 	"github.com/gojargo/mempher/internal/pgtest"
 	"github.com/gojargo/mempher/postgres"

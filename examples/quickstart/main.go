@@ -21,6 +21,7 @@ import (
 	"time"
 
 	"github.com/jackc/pgx/v5/pgxpool"
+
 	"github.com/gojargo/mempher"
 	"github.com/gojargo/mempher/memphertest"
 	"github.com/gojargo/mempher/postgres"
