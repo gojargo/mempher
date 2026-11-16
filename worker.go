@@ -3,12 +3,10 @@
 package mempher
 
 import (
-	"cmp"
 	"context"
 	"fmt"
 	"log/slog"
 	"os"
-	"slices"
 	"strings"
 	"time"
 	"unicode/utf8"
@@ -352,15 +350,13 @@ func (w *Worker) runJob(ctx context.Context, job Job) error {
 // rows. The whole batch is embedded in one call, because that is where the money
 // goes.
 func (w *Worker) encode(ctx context.Context, job Job) error {
-	episodes := make([]Episode, 0, len(job.Episodes))
-	texts := make([]string, 0, len(job.Episodes))
-	for _, id := range job.Episodes {
-		episode, err := w.store.Episode(ctx, job.Scope, id)
-		if err != nil {
-			return fmt.Errorf("read episode %s: %w", id, err)
-		}
-		episodes = append(episodes, episode)
-		texts = append(texts, episode.Content)
+	episodes, err := w.store.Episodes(ctx, job.Scope, job.Episodes)
+	if err != nil {
+		return fmt.Errorf("read %d episodes: %w", len(job.Episodes), err)
+	}
+	texts := make([]string, len(episodes))
+	for i, episode := range episodes {
+		texts[i] = episode.Content
 	}
 
 	vectors, err := w.embedder.EmbedDocuments(ctx, texts)
@@ -373,15 +369,17 @@ func (w *Worker) encode(ctx context.Context, job Job) error {
 	}
 
 	encodedAt := w.clock.Now()
+	encodings := make([]Encoding, len(episodes))
 	for i, episode := range episodes {
-		if err := w.store.PutEncoding(ctx, Encoding{
+		encodings[i] = Encoding{
 			Episode:   episode.ID,
 			Model:     w.embedder.Model(),
 			Vector:    vectors[i],
 			EncodedAt: encodedAt,
-		}); err != nil {
-			return fmt.Errorf("write encoding for episode %s: %w", episode.ID, err)
 		}
+	}
+	if err := w.store.PutEncodings(ctx, encodings); err != nil {
+		return fmt.Errorf("write %d encodings: %w", len(encodings), err)
 	}
 	return nil
 }
@@ -450,17 +448,12 @@ func (w *Worker) extract(ctx context.Context, job Job) error {
 		return fmt.Errorf("job %s names no episodes: %w", job.ID, ErrInvalidConfig)
 	}
 
-	episodes := make([]Episode, 0, len(job.Episodes))
-	for _, id := range job.Episodes {
-		episode, err := w.store.Episode(ctx, job.Scope, id)
-		if err != nil {
-			return fmt.Errorf("read episode %s: %w", id, err)
-		}
-		episodes = append(episodes, episode)
-	}
 	// Seq order, because an extractor reading a conversation out of order
 	// resolves "then" and "that" against the wrong episode.
-	slices.SortFunc(episodes, func(a, b Episode) int { return cmp.Compare(a.Seq, b.Seq) })
+	episodes, err := w.store.Episodes(ctx, job.Scope, job.Episodes)
+	if err != nil {
+		return fmt.Errorf("read %d episodes: %w", len(job.Episodes), err)
+	}
 	latest := episodes[len(episodes)-1]
 
 	// What the scope believed when these episodes arrived, valid at the moment

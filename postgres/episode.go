@@ -159,6 +159,48 @@ func (s *Store) Episode(
 	return ep, nil
 }
 
+// Episodes returns the named episodes of a scope in Seq order, or
+// [mempher.ErrNotFound] if any of them is not in the scope.
+func (s *Store) Episodes(
+	ctx context.Context,
+	scope mempher.ScopeID,
+	ids []mempher.EpisodeID,
+) ([]mempher.Episode, error) {
+	if err := scope.Validate(); err != nil {
+		return nil, fmt.Errorf("mempher/postgres: episodes: %w", err)
+	}
+	rows, err := s.pool.Query(ctx,
+		`SELECT `+episodeColumns+` FROM mempher.episodes
+		 WHERE scope_id = $1 AND id = ANY($2) ORDER BY seq`,
+		string(scope), episodeUUIDs(ids))
+	if err != nil {
+		return nil, fmt.Errorf("mempher/postgres: episodes in scope %q: %w", scope, err)
+	}
+	defer rows.Close()
+
+	out := make([]mempher.Episode, 0, len(ids))
+	for rows.Next() {
+		ep, err := scanEpisode(rows)
+		if err != nil {
+			return nil, fmt.Errorf("mempher/postgres: episodes in scope %q: %w", scope, err)
+		}
+		out = append(out, ep)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("mempher/postgres: episodes in scope %q: %w", scope, err)
+	}
+	// ANY() matches a repeated id once, so the count to reach is of distinct ids.
+	distinct := make(map[mempher.EpisodeID]struct{}, len(ids))
+	for _, id := range ids {
+		distinct[id] = struct{}{}
+	}
+	if len(out) != len(distinct) {
+		return nil, fmt.Errorf("mempher/postgres: %d of %d episodes are not in scope %q: %w",
+			len(distinct)-len(out), len(distinct), scope, mempher.ErrNotFound)
+	}
+	return out, nil
+}
+
 // Replay returns up to limit episodes of a scope in Seq order, starting after
 // afterSeq. The ordering is the point: consolidation has to see history as it
 // happened.

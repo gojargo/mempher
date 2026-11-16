@@ -405,6 +405,40 @@ func TestAppendWithNilBinding(t *testing.T) {
 	}
 }
 
+func TestEpisodesReadsABatchInSeqOrder(t *testing.T) {
+	t.Parallel()
+	store, _ := migrated(t)
+	ctx := t.Context()
+	at := time.Date(2026, 3, 1, 0, 0, 0, 0, time.UTC)
+
+	var ids []mempher.EpisodeID
+	for _, content := range []string{"first", "second", "third"} {
+		res, err := store.Append(ctx, episode("user:1", content, at))
+		if err != nil {
+			t.Fatalf("Append: %v", err)
+		}
+		ids = append(ids, res.Episodes[0].ID)
+	}
+	other, err := store.Append(ctx, episode("user:2", "elsewhere", at))
+	if err != nil {
+		t.Fatalf("Append: %v", err)
+	}
+
+	// Asked for out of order, and one of them twice.
+	got, err := store.Episodes(ctx, "user:1", []mempher.EpisodeID{ids[2], ids[0], ids[2]})
+	if err != nil {
+		t.Fatalf("Episodes: %v", err)
+	}
+	if len(got) != 2 || got[0].Content != "first" || got[1].Content != "third" {
+		t.Errorf("Episodes = %v, want first then third", got)
+	}
+
+	_, err = store.Episodes(ctx, "user:1", []mempher.EpisodeID{ids[0], other.Episodes[0].ID})
+	if !errors.Is(err, mempher.ErrNotFound) {
+		t.Errorf("an episode of another scope: err = %v, want mempher.ErrNotFound", err)
+	}
+}
+
 func TestEpisodeAndReplayRejectBadArguments(t *testing.T) {
 	t.Parallel()
 	store, _ := migrated(t)

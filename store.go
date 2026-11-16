@@ -33,6 +33,11 @@ type Store interface {
 	// Episode returns one episode by id within a scope, or [ErrNotFound].
 	Episode(ctx context.Context, scope ScopeID, id EpisodeID) (Episode, error)
 
+	// Episodes returns the named episodes of a scope in Seq order, in one
+	// read, or [ErrNotFound] if any of them is not in the scope. It is how a
+	// worker reads the episodes a job names.
+	Episodes(ctx context.Context, scope ScopeID, ids []EpisodeID) ([]Episode, error)
+
 	// Replay returns up to limit episodes of a scope in Seq order, starting
 	// after afterSeq. It is how a projection is rebuilt from L0.
 	Replay(ctx context.Context, scope ScopeID, afterSeq int64, limit int) ([]Episode, error)
@@ -43,11 +48,12 @@ type Store interface {
 	// with how many candidates it found and how long it took.
 	Recall(ctx context.Context, q RecallQuery) (Recollection, error)
 
-	// PutEncoding writes one encoding, replacing any existing one for the
-	// same episode and model, which is what makes encode jobs safe to retry.
-	// It fills the encoding's scope and ingest time from the episode row, and
-	// returns [ErrNotFound] if that episode does not exist.
-	PutEncoding(ctx context.Context, enc Encoding) error
+	// PutEncodings writes a batch of encodings in one statement, replacing
+	// any existing one for the same episode and model, which is what makes
+	// encode jobs safe to retry. The batch shares one Model and one EncodedAt.
+	// It fills each encoding's scope and ingest time from the episode row, and
+	// reports [ErrNotFound] if an episode does not exist.
+	PutEncodings(ctx context.Context, encodings []Encoding) error
 
 	// Forget erases episodes and every row this store holds that derives
 	// from them, and reports what went.

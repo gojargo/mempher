@@ -27,7 +27,10 @@ func (storeOnly) Replay(context.Context, ScopeID, int64, int) ([]Episode, error)
 func (storeOnly) Recall(context.Context, RecallQuery) (Recollection, error) {
 	return Recollection{}, errTestDouble
 }
-func (storeOnly) PutEncoding(context.Context, Encoding) error { return errTestDouble }
+func (storeOnly) Episodes(context.Context, ScopeID, []EpisodeID) ([]Episode, error) {
+	return nil, errTestDouble
+}
+func (storeOnly) PutEncodings(context.Context, []Encoding) error { return errTestDouble }
 func (storeOnly) Forget(context.Context, ForgetRequest) (ForgetResult, error) {
 	return ForgetResult{}, errTestDouble
 }
