@@ -21,6 +21,7 @@ const (
 	pgerrcodeUniqueViolation  = "23505"
 	pgerrcodeCheckViolation   = "23514"
 	pgerrcodeForeignKeyViolat = "23503"
+	pgerrcodeUndefinedFunction = "42883"
 )
 
 // Store persists episodes and their projections in PostgreSQL. It satisfies both

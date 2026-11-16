@@ -12,6 +12,7 @@ import (
 	"github.com/gojargo/mempher"
 	"github.com/gojargo/mempher/internal/pgtest"
 	"github.com/gojargo/mempher/memphertest"
+	"github.com/gojargo/mempher/ops"
 	"github.com/gojargo/mempher/postgres"
 )
 
@@ -139,10 +140,14 @@ func TestAppend(t *testing.T) {
 	})
 
 	t.Run("the encode job was enqueued in the same statement", func(t *testing.T) {
-		if len(got.Jobs) != 1 {
-			t.Fatalf("got %d jobs, want 1", len(got.Jobs))
+		jobs, err := store.Jobs(ctx, ops.JobQuery{Scope: "user:1"})
+		if err != nil {
+			t.Fatalf("Jobs: %v", err)
 		}
-		job := got.Jobs[0]
+		if len(jobs) != 1 {
+			t.Fatalf("got %d jobs, want 1", len(jobs))
+		}
+		job := jobs[0]
 		switch {
 		case job.ID.IsZero():
 			t.Error("no job id was returned")
@@ -353,7 +358,8 @@ func TestAppendRejectsBadCommands(t *testing.T) {
 	}
 }
 
-// TestAppendWithoutJobs checks the LEFT JOIN still yields the episode row.
+// TestAppendWithoutJobs checks an append that implies no work still writes the
+// episode, and queues nothing.
 func TestAppendWithoutJobs(t *testing.T) {
 	t.Parallel()
 	store, _ := migrated(t)
@@ -368,8 +374,12 @@ func TestAppendWithoutJobs(t *testing.T) {
 	if got.Episodes[0].ID.IsZero() || got.Episodes[0].Seq != 1 {
 		t.Errorf("episode = %+v, want an id and Seq 1", got.Episodes[0])
 	}
-	if len(got.Jobs) != 0 {
-		t.Errorf("got %d jobs, want none", len(got.Jobs))
+	jobs, err := store.Jobs(t.Context(), ops.JobQuery{Scope: "user:1"})
+	if err != nil {
+		t.Fatalf("Jobs: %v", err)
+	}
+	if len(jobs) != 0 {
+		t.Errorf("got %d jobs, want none", len(jobs))
 	}
 }
 
