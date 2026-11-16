@@ -121,6 +121,27 @@ func TestCompleteSendsAStrictSchemaAndReturnsTheContent(t *testing.T) {
 	}
 }
 
+func TestCompleteReadsContentGivenAsParts(t *testing.T) {
+	// A model that reasons first returns its reasoning and its answer as
+	// separate parts, and only the answer is the reply.
+	c, seen := serve(t, Config{}, http.StatusOK,
+		`{"choices":[{"finish_reason":"stop","message":{"role":"assistant","content":[`+
+			`{"type":"thinking","thinking":[{"type":"text","text":"let me think"}]},`+
+			`{"type":"text","text":"{\"assertions\":[],"},`+
+			`{"type":"text","text":"\"retractions\":[]}"}]}}]}`)
+
+	got, err := c.Complete(t.Context(), prompt(t))
+	if err != nil {
+		t.Fatalf("Complete: %v", err)
+	}
+	if string(got) != `{"assertions":[],"retractions":[]}` {
+		t.Fatalf("got %s, want the text parts joined and the reasoning left out", got)
+	}
+	if !strings.Contains(seen.body, `"top_p":1`) {
+		t.Fatalf("the request does not state top_p:\n%s", seen.body)
+	}
+}
+
 func TestLenientSendsTheSchemaUntouched(t *testing.T) {
 	// Some OpenAI-compatible gateways reject strict mode outright. The escape
 	// hatch costs the enum that enforces the vocabulary, and nothing else.
