@@ -19,6 +19,7 @@ import (
 // expects.
 const episodeColumns = `id, scope_id, seq, content, role, actor, source,
 	occurred_at, ingested_at, binding`
+
 // appendSQL is the whole of the write path: mempher.append validates the batch,
 // allocates its sequence numbers, inserts it and queues the jobs it implies, in
 // one statement. See 0005_api_append.sql.
