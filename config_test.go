@@ -24,11 +24,8 @@ func (storeOnly) Episode(context.Context, ScopeID, EpisodeID) (Episode, error) {
 func (storeOnly) Replay(context.Context, ScopeID, int64, int) ([]Episode, error) {
 	return nil, errTestDouble
 }
-func (storeOnly) SearchSemantic(context.Context, SemanticQuery) ([]Candidate, error) {
-	return nil, errTestDouble
-}
-func (storeOnly) SearchLexical(context.Context, LexicalQuery) ([]Candidate, error) {
-	return nil, errTestDouble
+func (storeOnly) Recall(context.Context, RecallQuery) (Recollection, error) {
+	return Recollection{}, errTestDouble
 }
 func (storeOnly) PutEncoding(context.Context, Encoding) error { return errTestDouble }
 func (storeOnly) Forget(context.Context, ForgetRequest) (ForgetResult, error) {
