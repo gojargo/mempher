@@ -4,6 +4,7 @@ import (
 	"context"
 	"fmt"
 	"testing"
+	"time"
 
 	"github.com/gojargo/mempher"
 	"github.com/gojargo/mempher/internal/pgtest"
@@ -205,7 +206,12 @@ func BenchmarkRecallWithFacts(b *testing.B) {
 		Match: "billing",
 		Assert: mempher.Assertion{
 			Subject: "billing", Predicate: "owned_by", Object: "payments team",
-			Statement:  "the billing service is owned by the payments team",
+			Statement: "the billing service is owned by the payments team",
+			// A fixed start, so every episode that mentions billing
+			// re-asserts the same window. Left to default to each episode's
+			// own time, the windows overlap and every extraction after the
+			// first is refused.
+			Valid:      mempher.Validity{From: time.Date(2026, 1, 1, 0, 0, 0, 0, time.UTC)},
 			Confidence: 0.9,
 		},
 	})
