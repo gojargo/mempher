@@ -162,7 +162,9 @@ type Queue interface {
 
 	// Fail records at time at that an attempt failed. The job returns to
 	// pending with RunAfter set to retryAt, unless that attempt exhausted
-	// MaxAttempts, in which case it goes dead.
+	// MaxAttempts, in which case it goes dead. A zero retryAt means the
+	// queue's own backoff: [DefaultRetryBackoff], doubling with each attempt
+	// up to [MaxRetryBackoff].
 	Fail(ctx context.Context, id JobID, worker WorkerID, cause error, at, retryAt time.Time) error
 
 	// Reclaim releases jobs whose leases expired before now, and reports how

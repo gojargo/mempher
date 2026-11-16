@@ -149,3 +149,131 @@ func TestSQLAppend(t *testing.T) {
 		}
 	})
 }
+
+func TestSQLQueue(t *testing.T) {
+	t.Parallel()
+	_, pool := migrated(t)
+	ctx := t.Context()
+
+	// One scope with one episode and its encode job, at a fixed instant.
+	if err := exec(t, pool, `
+		SELECT mempher.append('q', '[{"content":"x","role":"user","source":"s"}]',
+		                      '2026-01-01T00:00:00Z', ARRAY['encode'], 3)`); err != nil {
+		t.Fatalf("append: %v", err)
+	}
+	lease := func(t *testing.T, worker, at string) (string, int) {
+		t.Helper()
+		var id string
+		var attempts int
+		err := pool.QueryRow(ctx,
+			`SELECT id::text, attempts FROM mempher.lease_jobs($1, 1, NULL, '1 minute', $2::timestamptz)`,
+			worker, at).Scan(&id, &attempts)
+		if err != nil {
+			t.Fatalf("lease_jobs at %s: %v", at, err)
+		}
+		return id, attempts
+	}
+
+	t.Run("a failure backs off, doubling, and the last attempt is dead", func(t *testing.T) {
+		at := "2026-01-01T00:00:00Z"
+		wantDelay := []string{"00:00:10", "00:00:20"}
+		for attempt := 1; attempt <= 3; attempt++ {
+			id, got := lease(t, "w1", at)
+			if got != attempt {
+				t.Fatalf("attempts = %d at lease %d", got, attempt)
+			}
+			var state, delay string
+			err := pool.QueryRow(ctx, `
+				SELECT state, (run_after - $2::timestamptz)::text
+				FROM mempher.fail_job($1::uuid, 'w1', 'boom', $2::timestamptz)`, id, at).
+				Scan(&state, &delay)
+			if err != nil {
+				t.Fatalf("fail_job: %v", err)
+			}
+			if attempt < 3 {
+				if state != "pending" || delay != wantDelay[attempt-1] {
+					t.Fatalf("attempt %d: state %s, retry after %s, want pending after %s",
+						attempt, state, delay, wantDelay[attempt-1])
+				}
+				err = pool.QueryRow(ctx, `SELECT (run_after)::text FROM mempher.jobs WHERE id = $1::uuid`, id).Scan(&at)
+				if err != nil {
+					t.Fatalf("read run_after: %v", err)
+				}
+				continue
+			}
+			if state != "dead" {
+				t.Fatalf("after the last attempt, state = %s, want dead", state)
+			}
+		}
+	})
+
+	t.Run("a dead job is revived once, and not twice", func(t *testing.T) {
+		var id string
+		if err := pool.QueryRow(ctx, `SELECT id::text FROM mempher.jobs WHERE scope_id = 'q'`).Scan(&id); err != nil {
+			t.Fatalf("find job: %v", err)
+		}
+		var attempts int
+		if err := pool.QueryRow(ctx, `SELECT attempts FROM mempher.retry_job($1::uuid, '2026-01-02')`, id).Scan(&attempts); err != nil {
+			t.Fatalf("retry_job: %v", err)
+		}
+		if attempts != 0 {
+			t.Errorf("attempts = %d after retry, want 0", attempts)
+		}
+		wantSQLState(t, exec(t, pool, `SELECT mempher.retry_job($1::uuid, '2026-01-02')`, id), "MP024")
+		wantSQLState(t, exec(t, pool, `SELECT mempher.retry_job(uuidv7(), '2026-01-02')`), "MP020")
+	})
+
+	t.Run("only the worker holding a lease may finish it", func(t *testing.T) {
+		id, _ := lease(t, "w1", "2026-01-02T00:00:00Z")
+		wantSQLState(t, exec(t, pool, `SELECT mempher.succeed_job($1::uuid, 'w2', '2026-01-02')`, id), "MP023")
+		wantSQLState(t, exec(t, pool, `SELECT mempher.fail_job($1::uuid, 'w2', 'x', '2026-01-02')`, id), "MP023")
+		wantSQLState(t, exec(t, pool, `SELECT mempher.succeed_job(uuidv7(), 'w1', '2026-01-02')`), "MP020")
+
+		var released int
+		if err := pool.QueryRow(ctx, `SELECT mempher.reclaim_jobs('2026-01-02T00:05:00Z')`).Scan(&released); err != nil {
+			t.Fatalf("reclaim_jobs: %v", err)
+		}
+		if released != 1 {
+			t.Errorf("reclaimed %d, want the expired lease", released)
+		}
+		wantSQLState(t, exec(t, pool, `SELECT mempher.succeed_job($1::uuid, 'w1', '2026-01-02T00:06:00Z')`, id), "MP023")
+	})
+
+	t.Run("a long error is kept, truncated", func(t *testing.T) {
+		id, _ := lease(t, "w3", "2026-01-03T00:00:00Z")
+		var kept int
+		err := pool.QueryRow(ctx,
+			`SELECT length(last_error) FROM mempher.fail_job($1::uuid, 'w3', repeat('e', 5000), '2026-01-03')`, id).
+			Scan(&kept)
+		if err != nil {
+			t.Fatalf("fail_job: %v", err)
+		}
+		if want := 2000 + len("... (truncated)"); kept != want {
+			t.Errorf("kept %d characters, want %d", kept, want)
+		}
+	})
+
+	t.Run("purge refuses work still owed", func(t *testing.T) {
+		wantSQLState(t, exec(t, pool, `SELECT mempher.purge_jobs(now(), ARRAY['pending'])`), "MP009")
+		wantSQLState(t, exec(t, pool, `SELECT mempher.purge_jobs(NULL)`), "MP013")
+	})
+
+	t.Run("enqueue needs a scope that exists", func(t *testing.T) {
+		wantSQLState(t, exec(t, pool, `SELECT mempher.enqueue('encode', 'nobody', ARRAY[uuidv7()])`), "MP020")
+		wantSQLState(t, exec(t, pool, `SELECT mempher.enqueue('summarise', 'q', ARRAY[uuidv7()])`), "MP008")
+		wantSQLState(t, exec(t, pool, `SELECT mempher.enqueue('encode', 'q', '{}')`), "MP013")
+	})
+
+	t.Run("enqueueing outstanding work returns the job already holding it", func(t *testing.T) {
+		var first, second string
+		if err := pool.QueryRow(ctx, `SELECT id::text FROM mempher.enqueue('extract', 'q', ARRAY['01900000-0000-7000-8000-000000000001'::uuid])`).Scan(&first); err != nil {
+			t.Fatalf("enqueue: %v", err)
+		}
+		if err := pool.QueryRow(ctx, `SELECT id::text FROM mempher.enqueue('extract', 'q', ARRAY['01900000-0000-7000-8000-000000000001'::uuid])`).Scan(&second); err != nil {
+			t.Fatalf("enqueue again: %v", err)
+		}
+		if first != second {
+			t.Errorf("second enqueue made job %s, want the outstanding %s", second, first)
+		}
+	})
+}

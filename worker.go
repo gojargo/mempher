@@ -24,7 +24,9 @@ const (
 	// leases have expired.
 	DefaultReclaimInterval = time.Minute
 	// DefaultRetryBackoff is how long a job waits before its second attempt.
-	// Each further attempt doubles it, up to [MaxRetryBackoff].
+	// Each further attempt doubles it, up to [MaxRetryBackoff]. The queue
+	// applies it, in mempher.fail_job, so a worker in any language gets the
+	// same schedule; these constants document it.
 	DefaultRetryBackoff = 10 * time.Second
 	// MaxRetryBackoff caps the wait between attempts.
 	MaxRetryBackoff = 10 * time.Minute
@@ -450,31 +452,11 @@ func (w *Worker) extract(ctx context.Context, job Job) error {
 // reportFailure hands a failed job back to the queue with a retry time.
 func (w *Worker) reportFailure(ctx context.Context, job Job, cause error) {
 	now := w.clock.Now()
-	if err := w.queue.Fail(ctx, job.ID, w.id, cause, now, now.Add(retryBackoff(job.Attempts))); err != nil {
+	if err := w.queue.Fail(ctx, job.ID, w.id, cause, now, time.Time{}); err != nil {
 		w.logFailure(ctx, "recording a job failure", err)
 		return
 	}
 	w.logFailure(ctx, fmt.Sprintf("running %s job %s", job.Kind, job.ID), cause)
-}
-
-// retryBackoff is how long a job waits before its next attempt: doubling from
-// [DefaultRetryBackoff] up to [MaxRetryBackoff].
-//
-// It has no jitter, so a test can predict it exactly. The herd it might stampede
-// is a database that just told every worker the same thing, which is a problem
-// worth having.
-func retryBackoff(attempt int) time.Duration {
-	if attempt < 1 {
-		attempt = 1
-	}
-	backoff := DefaultRetryBackoff
-	for range attempt - 1 {
-		backoff *= 2
-		if backoff >= MaxRetryBackoff {
-			return MaxRetryBackoff
-		}
-	}
-	return backoff
 }
 
 // knownFactCue is the text the known facts are ranked against: what these

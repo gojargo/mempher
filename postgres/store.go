@@ -16,11 +16,11 @@ import (
 
 // SQLSTATEs this adapter reacts to rather than passes through.
 const (
-	pgerrcodeUndefinedTable   = "42P01"
-	pgerrcodeInvalidSchema    = "3F000"
-	pgerrcodeUniqueViolation  = "23505"
-	pgerrcodeCheckViolation   = "23514"
-	pgerrcodeForeignKeyViolat = "23503"
+	pgerrcodeUndefinedTable    = "42P01"
+	pgerrcodeInvalidSchema     = "3F000"
+	pgerrcodeUniqueViolation   = "23505"
+	pgerrcodeCheckViolation    = "23514"
+	pgerrcodeForeignKeyViolat  = "23503"
 	pgerrcodeUndefinedFunction = "42883"
 )
 
