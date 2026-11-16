@@ -27,6 +27,11 @@ embedder, err := openai.New(openai.Config{
 The width is declared, because the schema is migrated for it, and every reply
 is checked against it.
 
+An embedding model rejects a text over its input limit, about 8,000 tokens
+for OpenAI's. If your episodes can be longer, such as pasted code or
+documents, set `MaxInputBytes` below that limit: a long episode is then
+embedded by its start, and stored whole.
+
 Vectors are keyed by model id. Changing the model does not touch existing
 rows: the new model's vectors are a backfill.
 

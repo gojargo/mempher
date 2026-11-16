@@ -67,7 +67,32 @@ Reproduce with `make eval LONGMEMEVAL=/path/to/longmemeval_s`. The harness is
 between two people, 5,882 turns in all, and 1,540 questions (the adversarial
 category is left out, as is usual). For each question mempher recalls, a model
 writes an answer from what came back, and a second model judges the answer
-against the expected one.
+against the expected one. The judge is told to accept other wording and other
+date formats, and to require the same answer.
+
+### OpenAI models
+
+| Recall returns | accuracy | single-hop | temporal | multi-hop | open-domain | context |
+| --- | --- | --- | --- | --- | --- | --- |
+| episodes | 0.708 | 0.810 | 0.670 | 0.532 | 0.469 | 450 tokens |
+| episodes and facts (the default) | 0.734 | 0.832 | 0.692 | 0.578 | 0.469 | 887 tokens |
+| facts | 0.331 | 0.366 | 0.259 | 0.319 | 0.292 | 437 tokens |
+
+| | |
+| --- | --- |
+| Extractor | `gpt-4o-mini`, up to 64 assertions per extraction |
+| Embedder | `text-embedding-3-small`, 1536 dimensions |
+| Answers | `gpt-4o-mini` |
+| Judge | `gpt-4o` |
+| Recall | 10 episodes, 32 facts, no token budget |
+
+- The extractor kept 949 facts, and every extraction job succeeded.
+- The labelled evidence came back for 79% of questions. With it, 81% of
+  answers were right; without it, 47% with facts and 31% without.
+- The run took 38 minutes. [Comparison](comparison.md) puts it next to the
+  figures published for other systems.
+
+### Mistral models
 
 | Recall returns | accuracy | single-hop | temporal | multi-hop | open-domain | context |
 | --- | --- | --- | --- | --- | --- | --- |
