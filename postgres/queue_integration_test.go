@@ -1051,3 +1051,55 @@ func TestPurgeRefusesOutstandingWork(t *testing.T) {
 		t.Errorf("purge with no horizon err = %v, want mempher.ErrInvalidConfig", err)
 	}
 }
+
+// TestLeaseRunsAScopesExtractionsInOrder is what lets a later message supersede
+// an earlier one: an extraction is shown the facts its scope holds, so it must
+// not run beside an older extraction of the same scope.
+func TestLeaseRunsAScopesExtractionsInOrder(t *testing.T) {
+	t.Parallel()
+	store, _ := migrated(t)
+	ctx := t.Context()
+
+	first, second := seedScope(t, store, "user:1"), seedScope(t, store, "user:1")
+	other := seedScope(t, store, "user:2")
+	enqueue := func(scope mempher.ScopeID, id mempher.EpisodeID) mempher.JobID {
+		t.Helper()
+		job, err := store.Enqueue(ctx, mempher.NewJob{
+			Kind: mempher.JobKindExtract, Scope: scope, Episodes: []mempher.EpisodeID{id},
+		}, epoch)
+		if err != nil {
+			t.Fatalf("Enqueue: %v", err)
+		}
+		return job.ID
+	}
+	older, newer, elsewhere := enqueue("user:1", first), enqueue("user:1", second), enqueue("user:2", other)
+
+	extracts := func(worker mempher.WorkerID) []mempher.JobID {
+		t.Helper()
+		req := lease(worker, epoch, 10)
+		req.Kinds = []mempher.JobKind{mempher.JobKindExtract}
+		leased, err := store.Lease(ctx, req)
+		if err != nil {
+			t.Fatalf("Lease: %v", err)
+		}
+		ids := make([]mempher.JobID, len(leased))
+		for i, job := range leased {
+			ids[i] = job.ID
+		}
+		return ids
+	}
+
+	got := extracts("w1")
+	if len(got) != 2 || got[0] != older || got[1] != elsewhere {
+		t.Fatalf("first lease = %v, want the older job of user:1 and the job of user:2", got)
+	}
+	if got := extracts("w2"); len(got) != 0 {
+		t.Fatalf("leased %v while the older extraction of user:1 is running", got)
+	}
+	if err := store.Succeed(ctx, older, "w1", epoch); err != nil {
+		t.Fatalf("Succeed: %v", err)
+	}
+	if got := extracts("w2"); len(got) != 1 || got[0] != newer {
+		t.Fatalf("lease after the older job finished = %v, want the newer job of user:1", got)
+	}
+}

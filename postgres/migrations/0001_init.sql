@@ -1095,6 +1095,14 @@ BEGIN
     -- The attempt is counted here, at lease time, rather than when it fails: a
     -- worker that dies mid-job never reports, and its attempt must still count
     -- or a job that kills its worker would be retried for ever.
+    --
+    -- A scope's extract jobs run one at a time, oldest first: only one with no
+    -- older extract job of its scope still pending or running is claimable.
+    -- An extraction is shown the facts the scope already holds, so that it can
+    -- supersede them. Two of one scope run side by side would each miss the
+    -- other's facts, and the later message would fail to replace what the
+    -- earlier one said. Other scopes, and the other kinds, still run in
+    -- parallel. A dead job no longer holds its successors back.
     RETURN QUERY
     WITH claimed AS (
         UPDATE mempher.jobs j SET
@@ -1107,6 +1115,10 @@ BEGIN
             SELECT c.id FROM mempher.jobs c
             WHERE c.state = 'pending' AND c.run_after <= p_at AND c.attempts < c.max_attempts
               AND (cardinality(v_kinds) = 0 OR c.kind = ANY(v_kinds))
+              AND NOT (c.kind = 'extract' AND EXISTS (
+                  SELECT 1 FROM mempher.jobs o
+                  WHERE o.kind = 'extract' AND o.scope_id = c.scope_id AND o.id < c.id
+                    AND o.state IN ('pending', 'running')))
             ORDER BY c.run_after, c.id
             LIMIT p_limit
             FOR UPDATE SKIP LOCKED)
