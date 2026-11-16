@@ -59,8 +59,22 @@ type QAConfig struct {
 	// Attempts is how many times a failing model call is tried before the
 	// question is recorded as an error. Zero means three.
 	Attempts int
+	// Haystacks is how many haystacks are ingested and answered at once. Zero
+	// means one. Above one, [QAConfig.Outstanding] is required, and every
+	// haystack's drain also works the others' jobs, which is how one queue is
+	// worked by many workers in a deployment.
+	Haystacks int
+	// Outstanding reports how many jobs of a scope are still pending or
+	// running. A haystack is answered only once it reports none, so that no
+	// question is asked of a memory still being built. Required when
+	// Haystacks is above one; otherwise a drain that finds the queue empty is
+	// taken to have finished.
+	Outstanding func(ctx context.Context, scope mempher.ScopeID) (int, error)
 	// Progress, when set, is called after each question of the first variant.
 	Progress func(done int, last QAResult)
+
+	// style is the dataset's [Dataset.AnswerStyle].
+	style string
 }
 
 // QAResult is what one question came to under one variant.
@@ -71,8 +85,12 @@ type QAResult struct {
 	// Expected is the benchmark's answer, and Response the one given.
 	Expected string
 	Response string
-	// Correct is the judge's verdict.
+	// Correct is the judge's verdict. Under a rubric it means every item was
+	// fully met.
 	Correct bool
+	// Score is 1 for a correct answer and 0 for a wrong one, or under a
+	// rubric the mean of its items' scores.
+	Score float64
 	// Err is why there is no verdict: a model call that kept failing. Such a
 	// question is counted in [QASummary.Errors] and in no accuracy.
 	Err error
@@ -94,6 +112,10 @@ type QATypeSummary struct {
 	Questions int
 	Correct   int
 	Accuracy  float64
+	// Score is the mean [QAResult.Score].
+	Score float64
+
+	score float64
 }
 
 // QASummary is an end-to-end run under one variant.
@@ -108,6 +130,11 @@ type QASummary struct {
 	Questions int
 	Correct   int
 	Accuracy  float64
+	// Score is the mean [QAResult.Score]. It equals Accuracy unless questions
+	// are graded by rubric, where it gives partial credit.
+	Score float64
+	// Rubric reports that some questions were graded by rubric.
+	Rubric bool
 	// Errors is how many questions have no verdict.
 	Errors int
 	// Labelled is how many judged questions mark their evidence, and HitRate
@@ -130,6 +157,7 @@ type QASummary struct {
 
 	hits, hitCorrect, missCorrect int
 	facts, episodes, tokens       int
+	score                         float64
 }
 
 // RunQA answers every question in ds from what recall returns and has each
@@ -143,10 +171,17 @@ func RunQA(ctx context.Context, cfg QAConfig, ds Dataset) ([]QASummary, error) {
 		return nil, fmt.Errorf("eval: run qa: Memory is required: %w", mempher.ErrInvalidConfig)
 	case cfg.Answerer == nil || cfg.Judge == nil:
 		return nil, fmt.Errorf("eval: run qa: Answerer and Judge are required: %w", mempher.ErrInvalidConfig)
-	case cfg.Parallel < 0 || cfg.Attempts < 0:
-		return nil, fmt.Errorf("eval: run qa: Parallel and Attempts must not be negative: %w",
+	case cfg.Parallel < 0 || cfg.Attempts < 0 || cfg.Haystacks < 0:
+		return nil, fmt.Errorf("eval: run qa: Parallel, Attempts and Haystacks must not be negative: %w",
+			mempher.ErrInvalidConfig)
+	case cfg.Haystacks > 1 && cfg.Outstanding == nil:
+		return nil, fmt.Errorf("eval: run qa: Outstanding is required to answer haystacks in parallel: %w",
 			mempher.ErrInvalidConfig)
 	}
+	if cfg.Haystacks == 0 {
+		cfg.Haystacks = 1
+	}
+	cfg.style = ds.AnswerStyle
 	if cfg.Limit == 0 {
 		cfg.Limit = DefaultLimit
 	}
@@ -174,44 +209,81 @@ func RunQA(ctx context.Context, cfg QAConfig, ds Dataset) ([]QASummary, error) {
 		}
 	}
 
-	done := 0
-	flush := func(group []Question) error {
+	ctx, cancel := context.WithCancel(ctx)
+	defer cancel()
+	var (
+		mu       sync.Mutex
+		done     int
+		firstErr error
+		rubric   bool
+		wg       sync.WaitGroup
+		slots    = make(chan struct{}, cfg.Haystacks)
+	)
+	fail := func(err error) {
+		mu.Lock()
+		defer mu.Unlock()
+		if firstErr == nil {
+			firstErr = err
+			cancel()
+		}
+	}
+	flush := func(group []Question) {
 		if len(group) == 0 {
-			return nil
+			return
 		}
-		results, err := runQAGroup(ctx, cfg, group)
-		if err != nil {
-			return err
+		select {
+		case slots <- struct{}{}:
+		case <-ctx.Done():
+			return
 		}
-		for qi := range group {
-			for vi := range cfg.Variants {
-				summaries[vi].add(results[qi][vi])
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			defer func() { <-slots }()
+			results, err := runQAGroup(ctx, cfg, group)
+			if err != nil {
+				fail(err)
+				return
 			}
-			done++
-			if cfg.Progress != nil {
-				cfg.Progress(done, results[qi][0])
+			mu.Lock()
+			defer mu.Unlock()
+			for qi := range group {
+				for vi := range cfg.Variants {
+					summaries[vi].add(results[qi][vi])
+				}
+				done++
+				if cfg.Progress != nil {
+					cfg.Progress(done, results[qi][0])
+				}
 			}
-		}
-		return nil
+		}()
 	}
 
 	var group []Question
 	for question, err := range ds.Questions {
 		if err != nil {
-			return nil, err
+			fail(err)
+			break
+		}
+		if ctx.Err() != nil {
+			break
+		}
+		if len(question.Rubric) > 0 {
+			rubric = true
 		}
 		if len(group) > 0 && (question.Scope == "" || question.Scope != group[0].Scope) {
-			if err := flush(group); err != nil {
-				return nil, err
-			}
+			flush(group)
 			group = nil
 		}
 		group = append(group, question)
 	}
-	if err := flush(group); err != nil {
-		return nil, err
+	flush(group)
+	wg.Wait()
+	if firstErr != nil {
+		return nil, firstErr
 	}
 	for i := range summaries {
+		summaries[i].Rubric = rubric
 		summaries[i].finish()
 	}
 	return summaries, nil
@@ -230,7 +302,7 @@ func runQAGroup(ctx context.Context, cfg QAConfig, group []Question) ([][]QAResu
 		return nil, fmt.Errorf("eval: %s: ingest: %w", name, err)
 	}
 	if cfg.Worker != nil {
-		if err := drain(ctx, cfg.Worker); err != nil {
+		if err := drainScope(ctx, cfg, scope); err != nil {
 			return nil, fmt.Errorf("eval: %s: drain: %w", name, err)
 		}
 	}
@@ -302,7 +374,7 @@ func answerOne(
 		Answer *string `json:"answer"`
 	}
 	err = complete(ctx, cfg.Answerer, cfg.Attempts, extract.Prompt{
-		System: answerSystem,
+		System: answerSystemFor(cfg.style),
 		User:   answerPrompt(q, recollection),
 		Schema: answerSchema,
 	}, &answer, func() bool { return answer.Answer != nil })
@@ -311,6 +383,28 @@ func answerOne(
 		return out
 	}
 	out.Response = strings.TrimSpace(*answer.Answer)
+
+	if len(q.Rubric) > 0 {
+		total := 0.0
+		for _, item := range q.Rubric {
+			var graded struct {
+				Score *float64 `json:"score"`
+			}
+			err = complete(ctx, cfg.Judge, cfg.Attempts, extract.Prompt{
+				System: rubricSystem,
+				User:   rubricPrompt(q.Query, item, out.Response),
+				Schema: rubricSchema,
+			}, &graded, func() bool { return graded.Score != nil && validRubricScore(*graded.Score) })
+			if err != nil {
+				out.Err = fmt.Errorf("judge: %w", err)
+				return out
+			}
+			total += *graded.Score
+		}
+		out.Score = total / float64(len(q.Rubric))
+		out.Correct = out.Score == 1
+		return out
+	}
 
 	var verdict struct {
 		Correct *bool `json:"correct"`
@@ -325,6 +419,9 @@ func answerOne(
 		return out
 	}
 	out.Correct = *verdict.Correct
+	if out.Correct {
+		out.Score = 1
+	}
 	return out
 }
 
@@ -375,11 +472,23 @@ Use only the memory. When an excerpt says "yesterday" or "last week", work the
 date out from the date of that excerpt, not from today's. When a fact and an
 older excerpt disagree, the more recent information is the current one.
 
-Give the shortest answer that is complete: a name, a date, a number, a phrase,
-or a sentence or two when the question asks for advice. If the memory does not
-hold the answer, say that you do not know.
+%s
 
 Return JSON conforming to the schema you were given, and nothing else.`
+
+// defaultAnswerStyle is the form an answer takes unless [Dataset.AnswerStyle]
+// says otherwise.
+const defaultAnswerStyle = `Give the shortest answer that is complete: a name, a date, a number, a phrase,
+or a sentence or two when the question asks for advice. If the memory does not
+hold the answer, say that you do not know.`
+
+// answerSystemFor fills the answer prompt with a dataset's style.
+func answerSystemFor(style string) string {
+	if style == "" {
+		style = defaultAnswerStyle
+	}
+	return fmt.Sprintf(answerSystem, style)
+}
 
 const judgeSystem = `You grade an answer to a question about past conversations.
 
@@ -470,6 +579,8 @@ func (s *QASummary) add(r QAResult) {
 		s.ByType[r.Type] = byType
 	}
 	byType.Questions++
+	s.score += r.Score
+	byType.score += r.Score
 	if r.Correct {
 		s.Correct++
 		byType.Correct++
@@ -498,6 +609,9 @@ func ratio(n, of int) float64 {
 
 func (s *QASummary) finish() {
 	s.Accuracy = ratio(s.Correct, s.Questions)
+	if s.Questions > 0 {
+		s.Score = s.score / float64(s.Questions)
+	}
 	s.HitRate = ratio(s.hits, s.Labelled)
 	s.CorrectGivenHit = ratio(s.hitCorrect, s.hits)
 	s.CorrectGivenMiss = ratio(s.missCorrect, s.Labelled-s.hits)
@@ -506,6 +620,9 @@ func (s *QASummary) finish() {
 	s.MeanTokens = ratio(s.tokens, s.Questions)
 	for _, byType := range s.ByType {
 		byType.Accuracy = ratio(byType.Correct, byType.Questions)
+		if byType.Questions > 0 {
+			byType.Score = byType.score / float64(byType.Questions)
+		}
 	}
 }
 
@@ -514,8 +631,13 @@ func (s QASummary) String() string {
 	var b strings.Builder
 	fmt.Fprintf(&b, "%s, %s\n", s.Dataset, s.Variant)
 	fmt.Fprintf(&b, "answers by %s, judged by %s\n", s.Answerer, s.Judge)
-	fmt.Fprintf(&b, "accuracy %.3f (%d of %d), %d without a verdict\n",
-		s.Accuracy, s.Correct, s.Questions, s.Errors)
+	if s.Rubric {
+		fmt.Fprintf(&b, "rubric score %.3f over %d questions; fully met %.3f (%d); %d without a verdict\n",
+			s.Score, s.Questions, s.Accuracy, s.Correct, s.Errors)
+	} else {
+		fmt.Fprintf(&b, "accuracy %.3f (%d of %d), %d without a verdict\n",
+			s.Accuracy, s.Correct, s.Questions, s.Errors)
+	}
 	fmt.Fprintf(&b, "evidence recalled for %.3f of %d labelled; accuracy %.3f with it, %.3f without\n",
 		s.HitRate, s.Labelled, s.CorrectGivenHit, s.CorrectGivenMiss)
 	fmt.Fprintf(&b, "context: %.1f facts, %.1f episodes, %.0f tokens on average\n",
@@ -527,7 +649,112 @@ func (s QASummary) String() string {
 	slices.Sort(types)
 	for _, name := range types {
 		byType := s.ByType[name]
-		fmt.Fprintf(&b, "  %-28s %.3f  (%d of %d)\n", name, byType.Accuracy, byType.Correct, byType.Questions)
+		if s.Rubric {
+			fmt.Fprintf(&b, "  %-28s %.3f  (%d questions)\n", name, byType.Score, byType.Questions)
+		} else {
+			fmt.Fprintf(&b, "  %-28s %.3f  (%d of %d)\n", name, byType.Accuracy, byType.Correct, byType.Questions)
+		}
 	}
 	return b.String()
+}
+
+// drainPause is how long a haystack waits, when the queue offers nothing, for
+// jobs of its scope that another haystack's drain is running or that are
+// backing off after a failure.
+const drainPause = time.Second
+
+// drainScope works the queue until scope has no job left to wait for. With one
+// haystack at a time an empty queue means that; with several, a job of this
+// scope may be running under another haystack's drain, so the scope itself is
+// asked.
+func drainScope(ctx context.Context, cfg QAConfig, scope mempher.ScopeID) error {
+	if cfg.Outstanding == nil {
+		return drain(ctx, cfg.Worker)
+	}
+	for {
+		if err := drain(ctx, cfg.Worker); err != nil {
+			return err
+		}
+		left, err := cfg.Outstanding(ctx, scope)
+		if err != nil {
+			return err
+		}
+		if left == 0 {
+			return nil
+		}
+		select {
+		case <-ctx.Done():
+			return fmt.Errorf("eval: wait for %s: %w", scope, ctx.Err())
+		case <-time.After(drainPause):
+		}
+	}
+}
+
+// rubricSystem and rubricPrompt grade one rubric item. They are adapted from
+// the BEAM judge in mem0's memory-benchmarks (Apache-2.0), itself a port of
+// the unified_llm_judge_base_prompt of the BEAM paper's code, so that a score
+// here is graded the way published BEAM figures are.
+const rubricSystem = `You are an expert evaluator assessing whether an AI assistant's response satisfies
+specific rubric criteria. You must be objective, fair, and consistent.
+
+Return JSON conforming to the schema you were given, and nothing else.`
+
+func rubricPrompt(question, item, response string) string {
+	return fmt.Sprintf(`Evaluate whether the following LLM response demonstrates compliance with the specified RUBRIC CRITERION.
+
+QUESTION:
+%s
+
+LLM RESPONSE:
+%s
+
+RUBRIC CRITERION:
+%s
+
+SCORING GUIDELINES:
+
+First, determine whether the rubric criterion is a POSITIVE requirement (the response SHOULD include something) or a NEGATIVE constraint (the response SHOULD NOT include something).
+
+For POSITIVE requirements (response should contain, mention, or demonstrate something):
+- 1.0 (Complete Compliance): The required element is present, accurate, and complete. The response fully and clearly satisfies the rubric criterion.
+- 0.5 (Partial Compliance): The required element is partially present, has minor inaccuracies, or is incomplete. The core intent is present but not fully realized.
+- 0.0 (No Compliance): The required element is missing, incorrect, or the response is entirely off-topic / non-responsive.
+
+For NEGATIVE constraints (response should NOT contain or should avoid something):
+- 1.0 (Complete Compliance): The response is responsive to the question AND the prohibited element is absent.
+- 0.5 (Partial Compliance): The response is responsive but contains a borderline or ambiguous reference to the prohibited element.
+- 0.0 (No Compliance): The prohibited element is present in the response, OR the response is non-responsive (off-topic, refusal, empty).
+
+Compound statement handling: If the rubric criterion contains "and" or commas connecting multiple required elements:
+- All elements present and correct = 1.0
+- Some (but not all) elements present and correct = 0.5
+- No elements present or correct = 0.0
+
+EVALUATION RULES:
+1. Semantic tolerance: Paraphrases and synonyms are acceptable. The response does not need to use the exact same words as the rubric.
+2. Numeric and date equivalence: Treat equivalent representations as identical. "$68,000" = "68k" = "sixty-eight thousand dollars". "2 years" = "24 months". Prefer normalized comparison for numbers, currencies, dates, and durations.
+3. Case / punctuation / whitespace tolerance: Differences in capitalization, punctuation, and whitespace must be ignored when comparing content.
+4. Hedging tolerance: Do not penalize hedging language ("I think", "probably", "it seems"), passive voice, or verbosity if the substantive content satisfies the rubric criterion.
+5. Style neutrality: Do not penalize for tone, formatting, or length unless the rubric criterion specifically requires a particular format.
+6. Responsiveness: If the LLM response is completely off-topic or refuses to answer, score 0.0 for all criteria.
+7. Independence: Evaluate this criterion in isolation; do not consider other rubric items.
+8. Specificity matters: Vague or generic answers that could apply to any question score lower than specific, detailed answers.
+
+STEP-BY-STEP EVALUATION:
+1. Understand the Requirement: Read the rubric criterion and classify it as a positive requirement or a negative constraint.
+2. Parse Compound Statements: If the criterion contains multiple sub-requirements joined by "and" or commas, identify each element separately.
+3. Check Compliance: Compare the LLM response against each element, applying the tolerance rules above.
+4. Assign Score: Use the appropriate scoring table and compound-statement rule to determine the score.
+5. Provide Reasoning: Write a concise explanation referencing which elements were or were not satisfied.
+`, question, response, item)
+}
+
+var rubricSchema = json.RawMessage(`{"type":"object","additionalProperties":false,` +
+	`"required":["reason","score"],"properties":{` +
+	`"reason":{"type":"string","description":"One concise sentence explaining the score."},` +
+	`"score":{"type":"number","enum":[0,0.5,1]}}}`)
+
+// validRubricScore holds a judge to the three scores the rubric allows.
+func validRubricScore(score float64) bool {
+	return score == 0 || score == 0.5 || score == 1
 }

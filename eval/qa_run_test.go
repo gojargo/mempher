@@ -2,11 +2,14 @@ package eval_test
 
 import (
 	"bytes"
+	"context"
 	"fmt"
 	"io"
 	"net/http"
 	"os"
+	"slices"
 	"strconv"
+	"strings"
 	"testing"
 	"time"
 
@@ -18,6 +21,7 @@ import (
 	"github.com/gojargo/mempher/extract"
 	extractopenai "github.com/gojargo/mempher/extract/openai"
 	"github.com/gojargo/mempher/internal/pgtest"
+	"github.com/gojargo/mempher/ops"
 	"github.com/gojargo/mempher/postgres"
 )
 
@@ -41,16 +45,25 @@ import (
 // matters for a haystack ingested in batches of sixty-four dense turns.
 // QA_QUESTIONS caps the run, QA_PARALLEL answers that many questions of one
 // haystack at once, QA_RPS caps requests per second across every model, and
-// QA_K and QA_MAX_TOKENS set the recall limit and budget.
+// QA_K and QA_MAX_TOKENS set the recall limit and budget, and QA_VARIANTS
+// keeps only some of "episodes", "episodes and facts" and "facts".
+//
+// BEAM=/path/to/beam-1M.jsonl runs BEAM, converted as [eval.BEAM] describes.
+// Its conversations are long enough that QA_HAYSTACKS, how many are ingested
+// and answered at once, decides whether a run takes hours or a day. Some of its
+// turns exceed an embedding model's input, which QA_EMBED_MAX_BYTES cuts to;
+// QA_MAX_PROMPT_BYTES raises what one extraction may send.
 func TestQA(t *testing.T) {
 	var dataset eval.Dataset
 	switch {
 	case os.Getenv("LOCOMO") != "":
 		dataset = eval.LoCoMo(os.Getenv("LOCOMO"))
+	case os.Getenv("BEAM") != "":
+		dataset = eval.BEAM(os.Getenv("BEAM"))
 	case os.Getenv("LONGMEMEVAL") != "" && os.Getenv("QA_URL") != "":
 		dataset = eval.LongMemEval(os.Getenv("LONGMEMEVAL"))
 	default:
-		t.Skip("set LOCOMO or LONGMEMEVAL to a benchmark file, and QA_URL to a model endpoint")
+		t.Skip("set LOCOMO, BEAM or LONGMEMEVAL to a benchmark file, and QA_URL to a model endpoint")
 	}
 	url := os.Getenv("QA_URL")
 	if url == "" || os.Getenv("QA_ANSWER_MODEL") == "" || os.Getenv("QA_EMBED_MODEL") == "" {
@@ -81,7 +94,10 @@ func TestQA(t *testing.T) {
 		Model:      os.Getenv("QA_EMBED_MODEL"),
 		Dimensions: intFromEnv("QA_EMBED_DIMS", 0),
 		MaxBatch:   intFromEnv("QA_EMBED_BATCH", 0),
-		HTTPClient: client,
+		// A long episode is embedded by its start rather than failing its
+		// batch: OpenAI's limit is about 8,000 tokens.
+		MaxInputBytes: intFromEnv("QA_EMBED_MAX_BYTES", 0),
+		HTTPClient:    client,
 	})
 	if err != nil {
 		t.Fatalf("embedder: %v", err)
@@ -90,8 +106,9 @@ func TestQA(t *testing.T) {
 	var extractor mempher.Extractor
 	if model := os.Getenv("QA_EXTRACT_MODEL"); model != "" {
 		extractor, err = extract.New(completer(model), extract.Options{
-			MaxAssertions: intFromEnv("QA_MAX_ASSERTIONS", 0),
-			Instructions:  dataset.Instructions,
+			MaxAssertions:  intFromEnv("QA_MAX_ASSERTIONS", 0),
+			MaxPromptBytes: intFromEnv("QA_MAX_PROMPT_BYTES", 0),
+			Instructions:   dataset.Instructions,
 		})
 		if err != nil {
 			t.Fatalf("extract.New: %v", err)
@@ -114,6 +131,9 @@ func TestQA(t *testing.T) {
 	}
 	worker, err := mempher.NewWorker(mempher.WorkerConfig{
 		Store: store, Embedder: embedder, Extractor: extractor, ID: "qa",
+		// One job per lease, so that haystacks drained side by side share the
+		// queue's work rather than one of them leasing all of it.
+		Batch: 1,
 	})
 	if err != nil {
 		t.Fatalf("mempher.NewWorker: %v", err)
@@ -125,6 +145,17 @@ func TestQA(t *testing.T) {
 		variants = append(variants,
 			eval.Variant{Name: "episodes and facts", Channels: append(episodes, mempher.ChannelFact)},
 			eval.Variant{Name: "facts", Channels: []mempher.Channel{mempher.ChannelFact}})
+	}
+	// QA_VARIANTS keeps only the named variants, comma-separated: every
+	// variant is a judged answer per question, which is most of a run's cost.
+	if names := os.Getenv("QA_VARIANTS"); names != "" {
+		keep := strings.Split(names, ",")
+		variants = slices.DeleteFunc(variants, func(v eval.Variant) bool {
+			return !slices.Contains(keep, v.Name)
+		})
+		if len(variants) == 0 {
+			t.Fatalf("QA_VARIANTS=%q names no variant", names)
+		}
 	}
 
 	failures := 0
@@ -139,6 +170,15 @@ func TestQA(t *testing.T) {
 		FactLimit: intFromEnv("QA_FACTS", 0),
 		MaxTokens: intFromEnv("QA_MAX_TOKENS", 0),
 		Parallel:  intFromEnv("QA_PARALLEL", 4),
+		Haystacks: intFromEnv("QA_HAYSTACKS", 1),
+		Outstanding: func(ctx context.Context, scope mempher.ScopeID) (int, error) {
+			jobs, err := store.Jobs(ctx, ops.JobQuery{
+				Scope:  scope,
+				States: []mempher.JobState{mempher.JobStatePending, mempher.JobStateRunning},
+				Limit:  1,
+			})
+			return len(jobs), err
+		},
 		Progress: func(done int, last eval.QAResult) {
 			if last.Err != nil && failures < 5 {
 				failures++

@@ -37,6 +37,10 @@ type Question struct {
 	// acceptable, that the expected answer is a rubric, that the right answer
 	// is to decline. Used by [RunQA] only.
 	Grading string
+	// Rubric, when set, grades the answer in place of [Question.Answer]: a
+	// judge scores each item 0, 0.5 or 1 on its own, and the question scores
+	// their mean. BEAM is graded this way. Used by [RunQA] only.
+	Rubric []string
 	// Asked is when the question was put. It is recorded rather than applied:
 	// see [Config.BoundByQuestionTime].
 	Asked time.Time
@@ -58,6 +62,10 @@ type Dataset struct {
 	// for [extract.Options.Instructions]: who is speaking, when that is not
 	// an agent and the person it serves. Empty when there is nothing to say.
 	Instructions string
+	// AnswerStyle tells the model writing answers what form an answer takes,
+	// in place of the default: the shortest answer that is complete. Used by
+	// [RunQA] only.
+	AnswerStyle string
 	// Questions yields one question at a time.
 	//
 	// An iterator rather than a slice because a benchmark haystack runs to
@@ -274,26 +282,45 @@ func run(
 	return results, nil
 }
 
-// ingest writes the haystack in full batches, which is both faster and closer
-// to how a real import would do it.
+// ingestBatchBytes bounds the content of one append batch, beside the bound on
+// its length. A batch is one extraction prompt, and sixty-four turns of an
+// assistant pasting code would make a prompt larger than the extractor sends.
+const ingestBatchBytes = 96 << 10
+
+// ingest writes the haystack in batches of at most [mempher.MaxAppendBatch]
+// episodes and [ingestBatchBytes] of content, which is both faster than one at
+// a time and closer to how a real import would do it. An episode larger than
+// the byte bound is a batch of its own.
 func ingest(
 	ctx context.Context,
 	mem *mempher.Memory,
 	scope mempher.ScopeID,
 	haystack []mempher.AppendRequest,
 ) error {
-	for start := 0; start < len(haystack); start += mempher.MaxAppendBatch {
-		end := min(start+mempher.MaxAppendBatch, len(haystack))
-		batch := make([]mempher.AppendRequest, end-start)
-		for i := range batch {
-			batch[i] = haystack[start+i]
-			batch[i].Scope = scope
+	var (
+		batch []mempher.AppendRequest
+		bytes int
+	)
+	flush := func() error {
+		if len(batch) == 0 {
+			return nil
 		}
-		if _, err := mem.AppendBatch(ctx, batch); err != nil {
-			return err
-		}
+		_, err := mem.AppendBatch(ctx, batch)
+		batch, bytes = nil, 0
+		return err
 	}
-	return nil
+	for _, req := range haystack {
+		if len(batch) == mempher.MaxAppendBatch ||
+			(len(batch) > 0 && bytes+len(req.Content) > ingestBatchBytes) {
+			if err := flush(); err != nil {
+				return err
+			}
+		}
+		req.Scope = scope
+		batch = append(batch, req)
+		bytes += len(req.Content)
+	}
+	return flush()
 }
 
 // maxDrainPasses bounds the drain loop. A job that fails is not re-leased until

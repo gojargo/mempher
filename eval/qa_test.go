@@ -25,6 +25,7 @@ import (
 type echo struct {
 	mu      sync.Mutex
 	prompts []string
+	systems []string
 	fail    string
 }
 
@@ -33,6 +34,7 @@ func (e *echo) Model() string { return "echo" }
 func (e *echo) Complete(_ context.Context, p extract.Prompt) ([]byte, error) {
 	e.mu.Lock()
 	e.prompts = append(e.prompts, p.User)
+	e.systems = append(e.systems, p.System)
 	e.mu.Unlock()
 	if e.fail != "" && strings.Contains(p.User, e.fail) {
 		return nil, errors.New("the provider is down")
