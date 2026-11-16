@@ -22,7 +22,7 @@ const episodeColumns = `id, scope_id, seq, content, role, actor, source,
 
 // appendSQL is the whole of the write path: mempher.append validates the batch,
 // allocates its sequence numbers, inserts it and queues the jobs it implies, in
-// one statement. See 0005_api_append.sql.
+// one statement. See mempher.append in 0001_init.sql.
 const appendSQL = `SELECT id, seq FROM mempher.append($1, $2::jsonb, $3, $4, $5)`
 
 // appendEpisode is one element of mempher.append's episodes argument.

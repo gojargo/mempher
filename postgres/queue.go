@@ -1,7 +1,7 @@
 // The deferred-work port: claiming jobs, finishing them, and recovering the ones
 // a dead worker was holding.
 //
-// The queue's state machine is the SQL API's (0006_api_queue.sql): every method
+// The queue's state machine is the SQL API's (0001_init.sql): every method
 // that moves a job is one call to a mempher.* function, and only listing and
 // reading single jobs are plain queries against mempher.jobs.
 

@@ -20,7 +20,7 @@
 // validates its own input and raises a documented SQLSTATE in class MP for a
 // caller's mistake. [Store] maps those codes back to the mempher package's
 // sentinels, so errors.Is works as it always did. The functions are listed,
-// with their contract, at the top of 0005_api_append.sql and in the README.
+// with their contract, under "The SQL API" in 0001_init.sql and in the README.
 //
 // Migrations are embedded, forward-only and rendered as templates. See [Migrate].
 package postgres

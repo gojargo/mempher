@@ -224,8 +224,8 @@ ends with `put_fact_encodings`. The queue decides everything else.
 
 A caller's mistake raises a SQLSTATE in class `MP` (`MP001` an invalid scope,
 `MP020` not found, `MP023` a lease the worker no longer holds, and so on); the
-full list is at the top of
-[`0005_api_append.sql`](postgres/migrations/0005_api_append.sql). The Go
+full list is under "The SQL API" in
+[`0001_init.sql`](postgres/migrations/0001_init.sql). The Go
 package maps each code back to its sentinel error. Tables can be read directly;
 writing to them is the functions' job.
 
