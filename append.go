@@ -47,21 +47,24 @@ type AppendRequest struct {
 type AppendCommand struct {
 	// Episodes are the episodes to insert, in the order they should be
 	// sequenced. Required and never empty; every one of them names the same
-	// scope.
+	// scope and the same IngestedAt, because one command is one instant of
+	// system time.
 	Episodes []NewEpisode
 	// Jobs are enqueued in the same transaction. Their Episodes field is
 	// filled in by the [Store] with the ids it just minted -- all of them, so
 	// a batch of episodes yields one job per kind rather than one per
 	// episode. That is what lets a [Worker] embed the whole batch in one
 	// model call.
+	//
+	// They are ready as soon as the command commits, so RunAfter must be zero
+	// or the ingest time, and they share one MaxAttempts.
 	Jobs []NewJob
 }
 
 // AppendResult is what an [AppendCommand] produced.
 type AppendResult struct {
 	// Episodes are the episodes as persisted, with their minted IDs and
-	// Seqs, in the order they were given.
+	// Seqs, in the order they were given. The jobs enqueued alongside them
+	// are in the queue, and not repeated here.
 	Episodes []Episode
-	// Jobs are the jobs enqueued alongside them.
-	Jobs []Job
 }
