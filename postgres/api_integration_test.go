@@ -13,9 +13,9 @@ import (
 	"github.com/jackc/pgx/v5/pgxpool"
 )
 
-// The SQL API is called directly here, as a client in another language would
-// call it. The Go adapter's tests cover the same functions through Store; these
-// pin what a SQL caller sees: the SQLSTATE, which is the contract.
+// The SQL functions are called directly here. The Go adapter's tests cover the
+// same functions through Store; these pin what a SQL caller sees: the
+// SQLSTATE, which is the contract.
 
 // wantSQLState fails unless err is a PostgreSQL error with the given code.
 func wantSQLState(t *testing.T, err error, code string) {

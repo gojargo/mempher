@@ -23,8 +23,7 @@ const (
 	DefaultReclaimInterval = time.Minute
 	// DefaultRetryBackoff is how long a job waits before its second attempt.
 	// Each further attempt doubles it, up to [MaxRetryBackoff]. The queue
-	// applies it, in mempher.fail_job, so a worker in any language gets the
-	// same schedule; these constants document it.
+	// applies it, in mempher.fail_job; these constants document it.
 	DefaultRetryBackoff = 10 * time.Second
 	// MaxRetryBackoff caps the wait between attempts.
 	MaxRetryBackoff = 10 * time.Minute

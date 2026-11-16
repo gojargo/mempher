@@ -3,9 +3,8 @@
 -- The first half is the data: L0 (episodes, immutable and append-only), its
 -- vector projection, L1 (facts) with its extraction markers, its own vector
 -- projection and the entities its facts are about, and the job queue. The second half is the API: every rule the
--- library enforces is a function in the mempher schema, and every client -- the
--- Go package, a service in another language, psql -- is a caller of the same
--- functions.
+-- library enforces is a function in the mempher schema, and the Go package is
+-- a caller of these functions.
 --
 -- Rendered as a Go text/template before it runs. Two deployment decisions are
 -- substituted, both recorded in mempher.schema_config so drift is detectable
@@ -956,8 +955,8 @@ COMMENT ON FUNCTION mempher.append(text, jsonb, timestamptz, text[], int) IS
 -- The queue's whole state machine is these functions: claiming with SKIP
 -- LOCKED, the lease a worker must still hold to finish, the backoff between
 -- attempts, the dead state an exhausted job lands in, and reclaiming a dead
--- worker's leases. A worker in any language is a loop around lease_jobs and one
--- of succeed_job or fail_job; it decides nothing about the queue itself.
+-- worker's leases. A worker is a loop around lease_jobs and one of succeed_job
+-- or fail_job; it decides nothing about the queue itself.
 --
 -- Reading the queue needs no function: mempher.jobs is a plain table, and
 -- selecting from it is part of the contract.

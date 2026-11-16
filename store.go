@@ -18,8 +18,7 @@ import "context"
 //
 // Retrieval is one call rather than one per channel, so that the channels,
 // their fusion and the budget all run where the data is, in one round trip. The
-// postgres adapter implements it as the mempher.recall function, which a client
-// in any language can call.
+// postgres adapter implements it as the mempher.recall function.
 //
 // What a Store needs for operating a deployment rather than serving it -- the
 // scope catalogue, and the anti-join saying what work is outstanding -- is

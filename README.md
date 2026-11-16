@@ -20,9 +20,9 @@ mempher gives an agent a memory that lasts across conversations. You write
 what was said. Later you ask a question and get back the relevant messages and
 the facts known about the user.
 
-It runs in one PostgreSQL database. There is no vector service, no graph
-database and no sidecar. The logic is SQL functions in a `mempher` schema, so
-any language that can run a query can use it. A Go client is included.
+It runs in one PostgreSQL database. Vectors are stored with pgvector, and
+there is no vector service, no graph database and no sidecar. The logic is SQL
+functions in a `mempher` schema, called by a Go package.
 
 ## How it works
 
@@ -113,28 +113,7 @@ go run ./examples/quickstart
 The example needs no API key. It uses a small deterministic embedder and a few
 rules in place of a model.
 
-## Use it from SQL
-
-```sql
--- Write.
-SELECT * FROM mempher.append('user:8123',
-  '[{"content": "I''m allergic to hazelnuts.", "role": "user", "source": "cli"}]',
-  p_jobs := ARRAY['encode', 'extract']);
-
--- Read. $1 is the question's embedding.
-SELECT mempher.recall('user:8123', 'any food allergies?',
-  p_embedding  := $1,
-  p_model      := 'text-embedding-3-small',
-  p_extractor  := 'mempher-extract/v3+claude-opus-5+a3f9c1e2',
-  p_max_tokens := 2000);
-
--- Erase a user, with everything derived from their episodes.
-SELECT * FROM mempher.forget('user:8123');
-```
-
-The full list of functions is in [docs/sql-api.md](docs/sql-api.md).
-
-## Use it from Go
+## Usage
 
 ```go
 pool, _ := pgxpool.New(ctx, os.Getenv("DATABASE_URL"))
@@ -185,7 +164,7 @@ implementations for OpenAI-compatible and Anthropic APIs are included. See
 
 - PostgreSQL 18 or newer
 - the `vector` (pgvector), `btree_gin` and `btree_gist` extensions
-- Go 1.27, for the Go client and the worker
+- Go 1.26 or newer
 
 ## Documentation
 
@@ -193,10 +172,11 @@ implementations for OpenAI-compatible and Anthropic APIs are included. See
 | --- | --- |
 | [Concepts](docs/concepts.md) | the log and its projections, validity windows, forgetting |
 | [Entities](docs/entities.md) | aliases, merging, walking the graph |
-| [SQL API](docs/sql-api.md) | every function, the error codes, writing a worker in another language |
+| [Schema](docs/schema.md) | the SQL functions, their conventions and error codes |
 | [Models](docs/models.md) | plugging in an embedder and an extractor |
 | [Operations](docs/operations.md) | workers, backfill, the queue, rebuilding, testing |
 | [Benchmarks](docs/benchmarks.md) | latency and retrieval quality |
+| [Comparison](docs/comparison.md) | mem0, Zep and plain pgvector, and their LoCoMo scores |
 
 ## License
 

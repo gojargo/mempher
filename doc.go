@@ -31,11 +31,9 @@
 // Every rule above -- validation, sequencing, the queue's state machine, what
 // an extraction means for L1, fusion, the budget, erasure -- is implemented in
 // PostgreSQL, as functions in the mempher schema that the postgres subpackage
-// migrates and calls. This package and its Worker are a client of that SQL API,
-// and not the only possible one: a service in another language reaches the same
-// memory, with the same guarantees, by calling the same functions. What stays
-// in Go is what a database cannot do: calling an embedding model and an
-// extraction model.
+// migrates and calls. This package and its Worker are a thin client of those
+// functions. What stays in Go is what a database cannot do: calling an
+// embedding model and an extraction model.
 //
 // # The layers
 //

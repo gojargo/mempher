@@ -1,10 +1,10 @@
-# The SQL API
+# The schema
 
 Every rule mempher enforces is a function in the `mempher` schema. The Go
-package calls these functions, and so can any client that speaks SQL. A
-service in another language gets the same validation and the same guarantees.
+package is a thin client: each of its calls is one of these functions.
 
-Tables can be read directly. Writing is done through the functions.
+Tables can be read directly, for inspection. Writing is done through the
+functions.
 
 ## Functions
 
@@ -26,41 +26,6 @@ Tables can be read directly. Writing is done through the functions.
 Each public function has a `COMMENT ON FUNCTION` that describes its arguments;
 `\df+ mempher.*` in psql lists them. Functions whose name starts with an
 underscore are internal and may change.
-
-## Examples
-
-```sql
--- Write.
-SELECT * FROM mempher.append('user:8123',
-  '[{"content": "I''m allergic to hazelnuts.", "role": "user", "source": "cli"}]',
-  p_jobs := ARRAY['encode', 'extract']);
-
--- Read. The query embedding is the one thing computed outside the database.
-SELECT mempher.recall('user:8123', 'any food allergies?',
-  p_embedding  := $1,
-  p_model      := 'text-embedding-3-small',
-  p_extractor  := 'mempher-extract/v3+claude-opus-5+a3f9c1e2',
-  p_max_tokens := 2000);
-
--- What was true on a given day.
-SELECT statement, valid FROM mempher.search_facts('user:8123',
-  'mempher-extract/v3+claude-opus-5+a3f9c1e2', p_at := '2020-06-01');
-```
-
-## A worker in any language
-
-```mermaid
-flowchart LR
-    L["lease_jobs"] --> R["read the episodes"]
-    R --> M["call a model"]
-    M --> W["put_encodings<br/>or apply_extraction"]
-    W --> S["succeed_job<br/>or fail_job"]
-    S --> L
-```
-
-An `encode_facts` job reads `pending_fact_encodings` and ends with
-`put_fact_encodings`. Leases, retries, backoff and dead jobs are decided by
-the queue functions.
 
 ## Conventions
 
