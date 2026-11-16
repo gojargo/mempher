@@ -32,12 +32,20 @@ const (
 	// extraction, and a prompt fix reruns the reverse. One kind would couple
 	// a cheap backfill to an expensive one.
 	JobKindExtract JobKind = "extract"
+	// JobKindEncodeFacts embeds the statements of facts that have no vector
+	// yet. The database enqueues it, in mempher.apply_extraction, when an
+	// extraction leaves such a fact behind.
+	//
+	// It is its own kind rather than a last step of JobKindExtract so that
+	// an embedding call that fails is retried alone, instead of paying for
+	// the extraction again to reach it.
+	JobKindEncodeFacts JobKind = "encode_facts"
 )
 
 // Valid reports whether k is one of the defined kinds.
 func (k JobKind) Valid() bool {
 	switch k {
-	case JobKindEncode, JobKindExtract:
+	case JobKindEncode, JobKindExtract, JobKindEncodeFacts:
 		return true
 	default:
 		return false

@@ -342,6 +342,8 @@ func (q FactQuery) Validate() error {
 	case len(q.Text) > MaxContentLen:
 		return fmt.Errorf("mempher: fact query text is %d bytes, limit is %d: %w",
 			len(q.Text), MaxContentLen, ErrInvalidContent)
+	case q.Vector != nil && q.Model == "":
+		return fmt.Errorf("mempher: fact query has a vector but names no model: %w", ErrInvalidConfig)
 	}
 	return nil
 }

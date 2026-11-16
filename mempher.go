@@ -310,19 +310,33 @@ func (m *Memory) Recall(ctx context.Context, req RecallRequest) (Recollection, e
 
 	requested := m.resolveChannels(req.Channels)
 	failed := make(map[Channel]ChannelReport, len(requested))
-	var embedded time.Duration
+
+	// The question is embedded once, for both channels that read it: the
+	// semantic channel searches episodes with it, and the fact channel ranks
+	// facts with it. Only the first of those cannot run without it; facts fall
+	// back to ranking by words.
+	var (
+		embedded time.Duration
+		embedErr error
+	)
+	if slices.Contains(requested, ChannelSemantic) ||
+		(slices.Contains(requested, ChannelFact) && m.facts != nil) {
+		started := time.Now()
+		vector, err := m.embedder.EmbedQuery(ctx, req.Query)
+		embedded = time.Since(started)
+		if err != nil {
+			embedErr = fmt.Errorf("embed query: %w", err)
+		} else {
+			q.Vector, q.Model = vector, m.embedder.Model()
+		}
+	}
 	for _, channel := range requested {
 		switch channel {
 		case ChannelSemantic:
-			started := time.Now()
-			vector, err := m.embedder.EmbedQuery(ctx, req.Query)
-			embedded = time.Since(started)
-			if err != nil {
-				failed[channel] = ChannelReport{Channel: channel, Duration: embedded,
-					Err: fmt.Errorf("embed query: %w", err)}
+			if embedErr != nil {
+				failed[channel] = ChannelReport{Channel: channel, Duration: embedded, Err: embedErr}
 				continue
 			}
-			q.Vector, q.Model = vector, m.embedder.Model()
 		case ChannelFact:
 			if m.facts == nil {
 				failed[channel] = ChannelReport{Channel: channel, Err: fmt.Errorf(

@@ -516,3 +516,111 @@ func TestConfigRejectsAFactStoreWithNoExtractor(t *testing.T) {
 		t.Fatalf("err = %v, want ErrInvalidConfig", err)
 	}
 }
+
+// factVectors counts the rows of the facts' vector projection.
+func factVectors(t *testing.T, f *factFixture) int {
+	t.Helper()
+	var n int
+	if err := f.pool.QueryRow(t.Context(),
+		"SELECT count(*) FROM mempher.fact_encodings").Scan(&n); err != nil {
+		t.Fatalf("count fact encodings: %v", err)
+	}
+	return n
+}
+
+func TestFactsAreEncodedAndRankedByMeaning(t *testing.T) {
+	t.Parallel()
+	f := newFactFixture(t, allergicTo("peanuts"), allergicTo("shellfish"))
+
+	f.append(t, "user:1", "I am allergic to peanuts.")
+	f.append(t, "user:1", "And to shellfish.")
+	f.drain(t)
+
+	if got := factVectors(t, f); got != 2 {
+		t.Fatalf("%d fact vectors after draining, want one per fact", got)
+	}
+
+	// No Text, so the vector is the only thing ranking: without it the order
+	// is by object, peanuts first.
+	query := mempher.FactQuery{
+		Scope: "user:1", Extractor: f.extractor.Model(),
+		AsOf: f.clock.Now(), At: f.clock.Now(), Limit: 1,
+	}
+	plain, err := f.store.Facts(t.Context(), query)
+	if err != nil {
+		t.Fatalf("Facts: %v", err)
+	}
+	vector, err := f.embedder.EmbedQuery(t.Context(), "shellfish")
+	if err != nil {
+		t.Fatalf("EmbedQuery: %v", err)
+	}
+	query.Vector, query.Model = vector, f.embedder.Model()
+	near, err := f.store.Facts(t.Context(), query)
+	if err != nil {
+		t.Fatalf("Facts by meaning: %v", err)
+	}
+	if len(plain) != 1 || len(near) != 1 || plain[0].Object != "peanuts" || near[0].Object != "shellfish" {
+		t.Errorf("unranked: %v, nearest to shellfish: %v; want peanuts, then shellfish", plain, near)
+	}
+}
+
+func TestFactEncodingsRebuild(t *testing.T) {
+	t.Parallel()
+	f := newFactFixture(t, allergicTo("peanuts"), allergicTo("shellfish"))
+
+	f.append(t, "user:1", "I am allergic to peanuts.")
+	f.append(t, "user:1", "And to shellfish.")
+	f.drain(t)
+	if _, err := f.pool.Exec(t.Context(), "TRUNCATE mempher.fact_encodings"); err != nil {
+		t.Fatalf("truncate the fact encodings: %v", err)
+	}
+
+	operator, err := ops.New(ops.Config{Store: f.store, Embedder: f.embedder, Clock: f.clock})
+	if err != nil {
+		t.Fatalf("ops.New: %v", err)
+	}
+	jobs, err := operator.BackfillFactEncodings(t.Context(), "", time.Time{})
+	if err != nil {
+		t.Fatalf("BackfillFactEncodings: %v", err)
+	}
+	if jobs != 2 {
+		t.Errorf("enqueued %d jobs, want one per supporting episode", jobs)
+	}
+	again, err := operator.BackfillFactEncodings(t.Context(), "user:1", time.Time{})
+	if err != nil {
+		t.Fatalf("BackfillFactEncodings again: %v", err)
+	}
+	if again != 0 {
+		t.Errorf("a second backfill enqueued %d jobs, want 0", again)
+	}
+
+	f.drain(t)
+	if got := factVectors(t, f); got != 2 {
+		t.Errorf("%d fact vectors after the backfill drained, want 2", got)
+	}
+}
+
+func TestFactRecallSurvivesAnEmbeddingOutage(t *testing.T) {
+	t.Parallel()
+	f := newFactFixture(t, allergicTo("peanuts"))
+
+	f.append(t, "user:1", "I am allergic to peanuts.")
+	f.drain(t)
+	f.embedder.Fail(errors.New("the embedding provider is down"))
+
+	got, err := f.memory.Recall(t.Context(), mempher.RecallRequest{
+		Scope: "user:1", Query: "allergies",
+	})
+	if err != nil {
+		t.Fatalf("Recall: %v", err)
+	}
+	if len(got.Facts) != 1 {
+		t.Errorf("recalled %v, want the fact, ranked by words", statements(got))
+	}
+	if report(t, got, mempher.ChannelSemantic).Err == nil {
+		t.Error("the semantic channel reported no error with the embedder down")
+	}
+	if err := report(t, got, mempher.ChannelFact).Err; err != nil {
+		t.Errorf("the fact channel failed with the embedder down: %v", err)
+	}
+}

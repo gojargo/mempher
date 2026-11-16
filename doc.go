@@ -46,7 +46,9 @@
 // it holds and the episodes it was read from. It is opt-in: configure an
 // [Extractor] and appends enqueue [JobKindExtract] alongside the encode job, a
 // [Worker] drains it, and [Recollection.Facts] carries the result. Leave it nil
-// and none of that happens.
+// and none of that happens. Each fact's statement is embedded too, by a
+// [JobKindEncodeFacts] job the database enqueues after an extraction, so a
+// question finds a fact by meaning and not only by the words they share.
 //
 // Writing an [Extractor] is the one part of this that is a prompt rather than a
 // schema, so the extract subpackage ships one: it owns the prompt, the response

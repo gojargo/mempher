@@ -211,14 +211,16 @@ SELECT mempher.recall('user:8123', 'any food allergies?',
 | `recall` | run the channels, fuse, read the facts, spend the budget; returns one JSON document |
 | `lease_jobs`, `succeed_job`, `fail_job`, `reclaim_jobs` | run the queue: leases, attempts, backoff, dead jobs |
 | `put_encodings` | write a worker's vectors |
-| `apply_extraction` | write a worker's extraction: assertions, retractions, read markers |
-| `search_facts` | read L1 as of an instant |
+| `apply_extraction` | write a worker's extraction: assertions, retractions, read markers; queue the embedding of its facts |
+| `pending_fact_encodings`, `put_fact_encodings` | list the facts with no vector, and write a worker's vectors for them |
+| `search_facts` | read L1 as of an instant, ranked by meaning, by words, or both |
 | `forget` | erase a scope or some of its episodes, with everything derived from them |
-| `enqueue`, `retry_job`, `purge_jobs`, `job_stats`, `pending_episodes` | operate the queue and find work L0 still implies |
+| `enqueue`, `retry_job`, `purge_jobs`, `job_stats`, `pending_episodes`, `enqueue_fact_encodings` | operate the queue and find work L0 and L1 still imply |
 
 A worker in any language is a loop: `lease_jobs`, read the episodes, call a
 model, then `put_encodings` or `apply_extraction`, then `succeed_job` or
-`fail_job`. The queue decides everything else.
+`fail_job`. An `encode_facts` job reads `pending_fact_encodings` instead and
+ends with `put_fact_encodings`. The queue decides everything else.
 
 A caller's mistake raises a SQLSTATE in class `MP` (`MP001` an invalid scope,
 `MP020` not found, `MP023` a lease the worker no longer holds, and so on); the
@@ -315,7 +317,9 @@ you can point at rather than a `DELETE` anyone can write.
 L0 is what was said. L1 is what is true. Recall returns both and does not rank
 them against each other: episodes are fused by relevance to the query, while
 facts are simply what the scope currently believes, spent from the token budget
-first. A fact carries the window it holds over, so the answer to "where do they
+first. When a scope holds more facts than the limit, the question decides which
+are returned: each fact's statement is embedded, so "where do they live?" finds
+"Ana moved to Lisbon" without sharing a word with it. A fact carries the window it holds over, so the answer to "where do they
 live?" and the answer to "where did they live last year?" are both still there.
 
 Nothing is ever deleted to make that work. A claim the world has moved past has
