@@ -61,3 +61,7 @@ make check     # what CI runs
 Tests inject a `Clock` and a fake `Embedder` and never mock the database:
 retrieval depends on pgvector's distance ordering and PostgreSQL's text search
 ranking.
+
+Without Docker, set `PGTEST_DSN` to a `postgres://` URL on a PostgreSQL 18
+server with pgvector, whose role can create databases. Each test then gets its
+own database on that server instead of a container.

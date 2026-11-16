@@ -16,6 +16,7 @@ package pgtest
 import (
 	"context"
 	"fmt"
+	"os"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -27,6 +28,13 @@ import (
 	"github.com/testcontainers/testcontainers-go"
 	tcpostgres "github.com/testcontainers/testcontainers-go/modules/postgres"
 )
+
+// DSNEnv names an environment variable that, when set, points the tests at an
+// existing PostgreSQL 18 server with pgvector instead of starting a container,
+// for places without Docker such as a pod. It is a postgres:// URL to a
+// database from which the role can CREATE DATABASE, such as postgres. Each
+// test still gets its own database on that server.
+const DSNEnv = "PGTEST_DSN"
 
 // Image is the database every integration test runs against: PostgreSQL 18 for
 // uuidv7(), the pgvector image for the extension.
@@ -67,6 +75,10 @@ func Pool(t testing.TB) *pgxpool.Pool {
 		// Not t.Context(): the container outlives whichever test started it.
 		ctx, cancel := context.WithTimeout(context.Background(), startTimeout)
 		defer cancel()
+		if dsn := os.Getenv(DSNEnv); dsn != "" {
+			adminDSN = dsn
+			return
+		}
 		adminDSN, startErr = start(ctx)
 	})
 	if startErr != nil {
