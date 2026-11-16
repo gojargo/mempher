@@ -30,6 +30,9 @@ const (
 	DefaultRetryBackoff = 10 * time.Second
 	// MaxRetryBackoff caps the wait between attempts.
 	MaxRetryBackoff = 10 * time.Minute
+	// factEncodingPage is how many fact statements one embedding call holds,
+	// the same bound an append puts on a batch of episodes.
+	factEncodingPage = 64
 	// maxKnownFactCue caps the text the known facts are ranked against.
 	maxKnownFactCue = 8 << 10
 	// DefaultKnownFactLimit is how many of a scope's facts an [Extractor] is
@@ -90,7 +93,7 @@ type WorkerConfig struct {
 // this library lives, off the write path.
 //
 // It encodes episodes into vectors, and, when given an [Extractor], extracts
-// facts from them. A worker claims only the kinds it was configured to handle,
+// facts from them and encodes those too. A worker claims only the kinds it was configured to handle,
 // so running one without an extractor alongside one with it divides the work
 // rather than starving half of it.
 //
@@ -190,7 +193,7 @@ func NewWorker(cfg WorkerConfig) (*Worker, error) {
 		kinds:     []JobKind{JobKindEncode},
 	}
 	if w.extractor != nil {
-		w.kinds = append(w.kinds, JobKindExtract)
+		w.kinds = append(w.kinds, JobKindExtract, JobKindEncodeFacts)
 	}
 	if w.known == 0 {
 		w.known = DefaultKnownFactLimit
@@ -331,6 +334,12 @@ func (w *Worker) runJob(ctx context.Context, job Job) error {
 				job.ID, ErrInvalidConfig)
 		}
 		return w.extract(ctx, job)
+	case JobKindEncodeFacts:
+		if w.facts == nil {
+			return fmt.Errorf("job %s is an encode-facts job but this worker has no FactStore: %w",
+				job.ID, ErrInvalidConfig)
+		}
+		return w.encodeFacts(ctx, job)
 	default:
 		return fmt.Errorf("job %s has kind %q: %w", job.ID, job.Kind, ErrInvalidJobKind)
 	}
@@ -375,6 +384,56 @@ func (w *Worker) encode(ctx context.Context, job Job) error {
 		}
 	}
 	return nil
+}
+
+// encodeFacts embeds the statements of the facts a job's episodes support that
+// have no vector for this worker's [Embedder], a page at a time.
+//
+// Which facts those are is the database's answer, not the job's: the job names
+// episodes, and a retried or reclaimed job is asked again and finds only what
+// is still missing. A fact reworded or erased between the read and the write is
+// skipped by the store and, if it still exists, is pending for the job its
+// rewording enqueued.
+func (w *Worker) encodeFacts(ctx context.Context, job Job) error {
+	model := w.embedder.Model()
+	var after FactID
+	for {
+		pending, err := w.facts.PendingFactEncodings(ctx, PendingFactEncodings{
+			Model:    model,
+			Scope:    job.Scope,
+			Episodes: job.Episodes,
+			After:    after,
+			Limit:    factEncodingPage,
+		})
+		if err != nil {
+			return fmt.Errorf("read the facts with no encoding: %w", err)
+		}
+		if len(pending) == 0 {
+			return nil
+		}
+
+		statements := make([]string, len(pending))
+		for i, fact := range pending {
+			statements[i] = fact.Statement
+		}
+		vectors, err := w.embedder.EmbedDocuments(ctx, statements)
+		if err != nil {
+			return fmt.Errorf("embed %d fact statements: %w", len(statements), err)
+		}
+		if len(vectors) != len(pending) {
+			return fmt.Errorf("embedder %q returned %d vectors for %d statements: %w",
+				model, len(vectors), len(pending), ErrInvalidConfig)
+		}
+
+		encodings := make([]FactEncoding, len(pending))
+		for i, fact := range pending {
+			encodings[i] = FactEncoding{Fact: fact.ID, Statement: fact.Statement, Vector: vectors[i]}
+		}
+		if _, err := w.facts.PutFactEncodings(ctx, model, encodings, w.clock.Now()); err != nil {
+			return fmt.Errorf("write %d fact encodings: %w", len(encodings), err)
+		}
+		after = pending[len(pending)-1].ID
+	}
 }
 
 // extract reads a job's episodes and records the facts they yield.

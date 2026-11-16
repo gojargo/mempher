@@ -55,18 +55,27 @@ func (s *Store) validateEncoding(enc mempher.Encoding) error {
 			enc.Surprise, mempher.ErrInvalidConfig)
 	}
 
-	if got := enc.Vector.Dimensions(); got != s.vectorDimensions {
+	if err := s.validateVector(enc.Vector, enc.Model); err != nil {
+		return fmt.Errorf("mempher/postgres: put encoding: %w", err)
+	}
+	return nil
+}
+
+// validateVector checks a vector about to be stored, of an episode or of a
+// fact: it has the width the schema was migrated for, and every element is
+// finite.
+func (s *Store) validateVector(v mempher.Vector, model mempher.ModelID) error {
+	if got := v.Dimensions(); got != s.vectorDimensions {
 		return fmt.Errorf(
-			"mempher/postgres: put encoding: vector has %d dimensions but the schema was migrated for %d: %w",
+			"vector has %d dimensions but the schema was migrated for %d: %w",
 			got, s.vectorDimensions, mempher.ErrDimensionMismatch)
 	}
 	// pgvector rejects these, but as a parse error on a 20 KB literal, which
 	// says nothing about which model produced the bad value.
-	for i, f := range enc.Vector {
+	for i, f := range v {
 		if math.IsNaN(float64(f)) || math.IsInf(float64(f), 0) {
-			return fmt.Errorf(
-				"mempher/postgres: put encoding: vector element %d from model %q is %v: %w",
-				i, enc.Model, f, mempher.ErrInvalidConfig)
+			return fmt.Errorf("vector element %d from model %q is %v: %w",
+				i, model, f, mempher.ErrInvalidConfig)
 		}
 	}
 	return nil

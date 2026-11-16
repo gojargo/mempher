@@ -126,6 +126,9 @@ type BackfillResult struct {
 // overlapping job, which is wasteful and harmless, because every job body is
 // idempotent.
 //
+// Facts with no vector are not this function's business, because they are
+// not found by walking L0: see [Ops.BackfillFactEncodings].
+//
 // One call does one page. A caller that wants the whole log loops on
 // [BackfillResult.Done], which keeps a backfill of ten million episodes
 // cancellable and keeps its cost visible between pages instead of inside one
@@ -201,6 +204,41 @@ func (o *Ops) Backfill(ctx context.Context, req BackfillRequest) (BackfillResult
 			return out, nil
 		}
 	}
+}
+
+// BackfillFactEncodings enqueues the work of embedding every fact that has no
+// vector for this Ops' [mempher.Embedder], in one scope or, when scope is empty,
+// in all of them, and reports how many jobs it added.
+//
+// It is [Ops.Backfill] for the projection of L1 rather than of L0, and it is
+// wanted in the same three cases: facts extracted before fact encodings
+// existed, a change of embedding model, and a job that died. It is one call
+// rather than a paged walk because the database does the whole of it, in
+// mempher.enqueue_fact_encodings; nothing is read into this process. A zero
+// runAfter enqueues the jobs as ready.
+//
+// Like Backfill it makes no model call, and running it twice adds nothing the
+// second time.
+func (o *Ops) BackfillFactEncodings(
+	ctx context.Context,
+	scope mempher.ScopeID,
+	runAfter time.Time,
+) (int, error) {
+	if o.embedder == nil || o.facts == nil {
+		return 0, fmt.Errorf(
+			"mempher: backfill fact encodings: an Embedder and a FactStore are required: %w",
+			mempher.ErrInvalidConfig)
+	}
+	if scope != "" {
+		if err := scope.Validate(); err != nil {
+			return 0, fmt.Errorf("mempher: backfill fact encodings: %w", err)
+		}
+	}
+	jobs, err := o.facts.EnqueueFactEncodings(ctx, o.embedder.Model(), scope, o.clock.Now(), runAfter)
+	if err != nil {
+		return 0, fmt.Errorf("mempher: backfill fact encodings: %w", err)
+	}
+	return jobs, nil
 }
 
 // backfillScopePage is how many scopes are listed at a time while walking them

@@ -384,6 +384,233 @@ func TestSQLProjections(t *testing.T) {
 	})
 }
 
+func TestSQLFactEncodings(t *testing.T) {
+	t.Parallel()
+	_, pool := migrated(t)
+	ctx := t.Context()
+
+	appendOne := func(scope, content string) string {
+		t.Helper()
+		var id string
+		if err := pool.QueryRow(ctx, `
+			SELECT id::text FROM mempher.append($1,
+				jsonb_build_array(jsonb_build_object('content', $2::text, 'role', 'user', 'source', 's')),
+				'2026-01-01')`, scope, content).Scan(&id); err != nil {
+			t.Fatalf("append: %v", err)
+		}
+		return id
+	}
+	count := func(query string, args ...any) int {
+		t.Helper()
+		var n int
+		if err := pool.QueryRow(ctx, query, args...).Scan(&n); err != nil {
+			t.Fatalf("%s: %v", query, err)
+		}
+		return n
+	}
+	// Two facts no word of the question below appears in. By subject and
+	// predicate "likes" sorts before "lives_in"; by meaning, against the query
+	// vector (1,0), the home is nearer.
+	const (
+		home     = `{"subject":"ana","predicate":"lives_in","object":"Lisbon","statement":"Ana moved to Lisbon.","valid_from":"2026-01-01T00:00:00Z"}`
+		hobby    = `{"subject":"ana","predicate":"likes","object":"hiking","statement":"Ana walks the hills.","valid_from":"2026-01-01T00:00:00Z"}`
+		question = "which city is home"
+	)
+	first := appendOne("fe", "I moved to Lisbon and I walk the hills.")
+	if err := exec(t, pool,
+		`SELECT count(*) FROM mempher.apply_extraction('fe', 'x/v1', ARRAY[$1::uuid], $2::jsonb, '[]', '2026-01-02')`,
+		first, "["+home+","+hobby+"]"); err != nil {
+		t.Fatalf("apply_extraction: %v", err)
+	}
+	const encodeJobs = `SELECT count(*) FROM mempher.jobs WHERE scope_id = $1 AND kind = 'encode_facts'`
+
+	t.Run("an extraction that leaves a fact with no vector queues the work", func(t *testing.T) {
+		var episodes []string
+		err := pool.QueryRow(ctx, `
+			SELECT episode_ids::text[] FROM mempher.jobs
+			WHERE scope_id = 'fe' AND kind = 'encode_facts' AND state = 'pending'`).Scan(&episodes)
+		if err != nil {
+			t.Fatalf("read the job: %v", err)
+		}
+		if len(episodes) != 1 || episodes[0] != first {
+			t.Errorf("job names %v, want the extraction's episode %s", episodes, first)
+		}
+	})
+
+	t.Run("the facts are ranked by words alone until they have vectors", func(t *testing.T) {
+		var object string
+		err := pool.QueryRow(ctx, `
+			SELECT object FROM mempher.search_facts('fe', 'x/v1', '2026-06-01', '2026-06-01', $1,
+				p_limit := 1, p_embedding := $2::vector, p_model := 'm')`, question, axes(1, 0)).Scan(&object)
+		if err != nil {
+			t.Fatalf("search_facts: %v", err)
+		}
+		if object != "hiking" {
+			t.Errorf("first fact is %q, want hiking: nothing has a vector, so the order is by predicate", object)
+		}
+	})
+
+	t.Run("pending facts are listed, written once, and no longer pending", func(t *testing.T) {
+		var written int
+		err := pool.QueryRow(ctx, `
+			WITH pending AS (SELECT id, statement FROM mempher.pending_fact_encodings('m', 'fe', ARRAY[$1::uuid]))
+			SELECT mempher.put_fact_encodings('m',
+				(SELECT array_agg(id ORDER BY statement) FROM pending),
+				(SELECT array_agg(statement ORDER BY statement) FROM pending),
+				ARRAY[$2, $3]::vector[], '2026-01-03')`,
+			first, axes(1, 0), axes(0, 1)).Scan(&written)
+		if err != nil {
+			t.Fatalf("put_fact_encodings: %v", err)
+		}
+		if written != 2 {
+			t.Errorf("wrote %d vectors, want 2", written)
+		}
+		if n := count(`SELECT count(*) FROM mempher.pending_fact_encodings('m', 'fe')`); n != 0 {
+			t.Errorf("%d facts still pending for model m, want none", n)
+		}
+		if n := count(`SELECT count(*) FROM mempher.pending_fact_encodings('other', 'fe')`); n != 2 {
+			t.Errorf("%d facts pending for another model, want both: a vector is per model", n)
+		}
+	})
+
+	t.Run("search_facts ranks by meaning when given the question's embedding", func(t *testing.T) {
+		var byWords, byMeaning string
+		err := pool.QueryRow(ctx, `
+			SELECT (SELECT object FROM mempher.search_facts('fe', 'x/v1', '2026-06-01', '2026-06-01', $1, 1)),
+			       (SELECT object FROM mempher.search_facts('fe', 'x/v1', '2026-06-01', '2026-06-01', $1,
+			                p_limit := 1, p_embedding := $2::vector, p_model := 'm'))`,
+			question, axes(1, 0)).Scan(&byWords, &byMeaning)
+		if err != nil {
+			t.Fatalf("search_facts: %v", err)
+		}
+		if byWords != "hiking" || byMeaning != "Lisbon" {
+			t.Errorf("by words: %q, by meaning: %q; want hiking and Lisbon", byWords, byMeaning)
+		}
+	})
+
+	t.Run("recall ranks its facts by the embedding it is given", func(t *testing.T) {
+		var object string
+		err := pool.QueryRow(ctx, `
+			SELECT mempher.recall('fe', $1, $2::vector, 'm', 'x/v1', ARRAY['fact'],
+				p_fact_limit := 1, p_as_of := '2026-06-01') #>> '{facts,0,object}'`,
+			question, axes(1, 0)).Scan(&object)
+		if err != nil {
+			t.Fatalf("recall: %v", err)
+		}
+		if object != "Lisbon" {
+			t.Errorf("recall's one fact is %q, want Lisbon", object)
+		}
+	})
+
+	t.Run("an extraction that leaves every fact encoded queues nothing", func(t *testing.T) {
+		second := appendOne("fe", "Nothing new.")
+		if err := exec(t, pool,
+			`SELECT count(*) FROM mempher.apply_extraction('fe', 'x/v1', ARRAY[$1::uuid], '[]', '[]', '2026-01-04')`,
+			second); err != nil {
+			t.Fatalf("apply_extraction: %v", err)
+		}
+		if n := count(encodeJobs, "fe"); n != 1 {
+			t.Errorf("%d encode_facts jobs, want only the first", n)
+		}
+	})
+
+	t.Run("a vector made from a statement the fact no longer holds is not written", func(t *testing.T) {
+		var written int
+		err := pool.QueryRow(ctx, `
+			SELECT mempher.put_fact_encodings('other',
+				(SELECT array_agg(id) FROM mempher.facts WHERE scope_id = 'fe' AND object = 'Lisbon'),
+				ARRAY['Ana lives in Porto.'], ARRAY[$1]::vector[])`, axes(1, 0)).Scan(&written)
+		if err != nil {
+			t.Fatalf("put_fact_encodings: %v", err)
+		}
+		if written != 0 {
+			t.Errorf("wrote %d vectors for a stale statement, want 0", written)
+		}
+	})
+
+	t.Run("rewording a fact drops its vector and queues the work again", func(t *testing.T) {
+		third := appendOne("fe", "To be exact, I moved to Lisbon in January.")
+		reworded := strings.Replace(home, "Ana moved to Lisbon.", "Ana has lived in Lisbon since January.", 1)
+		if err := exec(t, pool,
+			`SELECT count(*) FROM mempher.apply_extraction('fe', 'x/v1', ARRAY[$1::uuid], $2::jsonb, '[]', '2026-01-05')`,
+			third, "["+reworded+"]"); err != nil {
+			t.Fatalf("apply_extraction: %v", err)
+		}
+		var pending []string
+		if err := pool.QueryRow(ctx,
+			`SELECT array_agg(statement) FROM mempher.pending_fact_encodings('m', 'fe')`).Scan(&pending); err != nil {
+			t.Fatalf("pending_fact_encodings: %v", err)
+		}
+		if len(pending) != 1 || pending[0] != "Ana has lived in Lisbon since January." {
+			t.Errorf("pending = %v, want only the reworded fact", pending)
+		}
+		if n := count(encodeJobs, "fe"); n != 2 {
+			t.Errorf("%d encode_facts jobs, want a second for the reworded fact", n)
+		}
+	})
+
+	t.Run("enqueue_fact_encodings queues what apply_extraction was told not to", func(t *testing.T) {
+		episode := appendOne("fe:quiet", "I moved to Lisbon.")
+		if err := exec(t, pool, `
+			SELECT count(*) FROM mempher.apply_extraction('fe:quiet', 'x/v1', ARRAY[$1::uuid], $2::jsonb,
+				p_at := '2026-01-02', p_encode := false)`, episode, "["+home+","+hobby+"]"); err != nil {
+			t.Fatalf("apply_extraction: %v", err)
+		}
+		if n := count(encodeJobs, "fe:quiet"); n != 0 {
+			t.Fatalf("%d encode_facts jobs after p_encode := false, want none", n)
+		}
+		added := count(`SELECT mempher.enqueue_fact_encodings('m', 'fe:quiet', '2026-01-03')`)
+		again := count(`SELECT mempher.enqueue_fact_encodings('m', 'fe:quiet', '2026-01-03')`)
+		if added != 1 || again != 0 {
+			t.Errorf("first call added %d jobs and the second %d; want 1, for the one episode, then 0", added, again)
+		}
+	})
+
+	t.Run("rejects", func(t *testing.T) {
+		fact := `(SELECT array_agg(id) FROM mempher.facts WHERE scope_id = 'fe' AND object = 'hiking')`
+		wantSQLState(t, exec(t, pool,
+			`SELECT mempher.put_fact_encodings('m', `+fact+`, ARRAY['s'], ARRAY['[1,2]'::vector])`), "MP021")
+		wantSQLState(t, exec(t, pool,
+			`SELECT mempher.put_fact_encodings('m', `+fact+`, ARRAY['s', 't'], ARRAY[$1]::vector[])`, axes(1)), "MP013")
+		wantSQLState(t, exec(t, pool,
+			`SELECT mempher.put_fact_encodings('m', `+fact+` || `+fact+`, ARRAY['s', 's'], ARRAY[$1, $1]::vector[])`,
+			axes(1)), "MP013")
+		wantSQLState(t, exec(t, pool,
+			`SELECT mempher.search_facts('fe', 'x/v1', p_embedding := $1::vector)`, axes(1)), "MP013")
+		wantSQLState(t, exec(t, pool,
+			`SELECT mempher.search_facts('fe', 'x/v1', p_embedding := '[1,2]'::vector, p_model := 'm')`), "MP021")
+		wantSQLState(t, exec(t, pool, `SELECT mempher.pending_episodes('encode_facts', 'm')`), "MP008")
+	})
+
+	t.Run("no vector outlives its fact", func(t *testing.T) {
+		const vectors = `SELECT count(*) FROM mempher.fact_encodings`
+		if n := count(vectors); n == 0 {
+			t.Fatal("no vectors left to erase; the earlier subtests should have left one")
+		}
+		if err := exec(t, pool, `SELECT mempher.forget('fe')`); err != nil {
+			t.Fatalf("forget: %v", err)
+		}
+		if n := count(vectors); n != 0 {
+			t.Errorf("%d vectors after forgetting the scope, want 0", n)
+		}
+
+		if err := exec(t, pool, `
+			SELECT mempher.put_fact_encodings('m', array_agg(id), array_agg(statement), array_agg($1::vector))
+			FROM mempher.facts WHERE scope_id = 'fe:quiet'`, axes(1, 0)); err != nil {
+			t.Fatalf("put_fact_encodings: %v", err)
+		}
+		if n := count(vectors); n != 2 {
+			t.Fatalf("%d vectors, want the two just written", n)
+		}
+		if err := exec(t, pool, `TRUNCATE mempher.facts, mempher.fact_extractions`); err != nil {
+			t.Fatalf("truncate L1: %v", err)
+		}
+		if n := count(vectors); n != 0 {
+			t.Errorf("%d vectors after truncating the facts, want 0", n)
+		}
+	})
+}
+
 // axes renders a testDimensions-wide vector literal with the given leading
 // components and zeros after them.
 func axes(components ...float64) string {

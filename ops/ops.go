@@ -54,10 +54,21 @@ type Store interface {
 	Purge(ctx context.Context, req PurgeRequest) (int, error)
 }
 
-// FactStore is the L1 half, needed only to backfill extractions.
+// FactStore is the L1 half, needed only to backfill extractions and the
+// encodings of the facts they produced.
 type FactStore interface {
 	// PendingExtractions returns ids of episodes no extraction marker covers.
 	PendingExtractions(ctx context.Context, q PendingExtractions) ([]mempher.EpisodeID, error)
+
+	// EnqueueFactEncodings queues a job for every fact with no vector for a
+	// model, in one scope or, when scope is empty, in all of them, and
+	// reports how many jobs it added.
+	EnqueueFactEncodings(
+		ctx context.Context,
+		model mempher.ModelID,
+		scope mempher.ScopeID,
+		now, runAfter time.Time,
+	) (int, error)
 }
 
 // Config assembles an [Ops]. Only Store is required.

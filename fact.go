@@ -288,6 +288,13 @@ type FactQuery struct {
 	// Limit when a scope holds more than fit; it never excludes a fact that
 	// the filters above admitted.
 	Text string
+	// Vector, when set, orders results by how near each statement's
+	// embedding is to it, fused with Text's ordering when both are given.
+	// Like Text it ranks and never excludes. It is the question embedded by
+	// Model, which is then required.
+	Vector Vector
+	// Model identifies the vector space of Vector.
+	Model ModelID
 	// Limit caps how many facts are returned. Zero means a store-chosen
 	// default.
 	Limit int
@@ -317,9 +324,57 @@ type FactStore interface {
 	ApplyExtraction(ctx context.Context, cmd ExtractCommand) ([]Fact, error)
 
 	// Facts returns the facts matching q, ordered by subject and predicate,
-	// or by relevance when [FactQuery.Text] is set.
+	// or by relevance when [FactQuery.Text] or [FactQuery.Vector] is set.
 	Facts(ctx context.Context, q FactQuery) ([]Fact, error)
 
 	// Fact returns one fact by id within a scope, or [ErrNotFound].
 	Fact(ctx context.Context, scope ScopeID, id FactID) (Fact, error)
+
+	// PendingFactEncodings returns facts with no encoding for a model, in id
+	// order, with the statement to embed.
+	PendingFactEncodings(ctx context.Context, q PendingFactEncodings) ([]PendingFact, error)
+
+	// PutFactEncodings writes one vector per fact for a model and reports
+	// how many it wrote. A fact that has gone, or whose statement no longer
+	// matches the one the vector was made from, is skipped: that is a race
+	// with an extraction or an erasure, not an error.
+	PutFactEncodings(ctx context.Context, model ModelID, encodings []FactEncoding, at time.Time) (int, error)
+}
+
+// PendingFactEncodings asks which facts have no vector for a model.
+type PendingFactEncodings struct {
+	// Model is the vector space to look in. Required.
+	Model ModelID
+	// Scope restricts the search to one partition. Empty means all scopes.
+	Scope ScopeID
+	// Episodes, when non-empty, keeps only facts one of them supports, which
+	// is how a [JobKindEncodeFacts] job names its work.
+	Episodes []EpisodeID
+	// After pages the listing: only facts with a greater id are returned.
+	After FactID
+	// Limit is the most facts to return. Zero means a store-chosen default.
+	Limit int
+}
+
+// PendingFact is a fact waiting for its vector.
+type PendingFact struct {
+	// ID is the fact.
+	ID FactID
+	// Scope is the partition it belongs to.
+	Scope ScopeID
+	// Statement is the text to embed.
+	Statement string
+}
+
+// FactEncoding is the vector projection of one fact's statement. Like an
+// [Encoding] it is derived and disposable.
+type FactEncoding struct {
+	// Fact is the fact this encodes.
+	Fact FactID
+	// Statement is the text Vector was made from. The store compares it with
+	// what the fact holds now, so a vector of a statement that has since been
+	// reworded is never written.
+	Statement string
+	// Vector is the embedding of Statement.
+	Vector Vector
 }

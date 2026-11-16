@@ -134,10 +134,21 @@ func (s *Store) Facts(ctx context.Context, q mempher.FactQuery) ([]mempher.Fact,
 	for i, predicate := range q.Predicates {
 		predicates[i] = string(predicate)
 	}
+	var vector, model *string
+	if q.Vector != nil {
+		if got := q.Vector.Dimensions(); got != s.vectorDimensions {
+			return nil, fmt.Errorf(
+				"mempher/postgres: facts: query vector has %d dimensions but the schema was migrated for %d: %w",
+				got, s.vectorDimensions, mempher.ErrDimensionMismatch)
+		}
+		formatted, name := formatVector(q.Vector), string(q.Model)
+		vector, model = &formatted, &name
+	}
 	facts, err := scanFacts(ctx, s.pool,
-		`SELECT `+factColumns+` FROM mempher.search_facts($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)`,
+		fmt.Sprintf(`SELECT `+factColumns+` FROM mempher.search_facts(
+			$1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11::%s, $12)`, s.vectorType),
 		string(q.Scope), string(q.Extractor), q.At, q.AsOf, text, int32(limit),
-		subjects, predicates, q.MinConfidence, q.IncludeClosed)
+		subjects, predicates, q.MinConfidence, q.IncludeClosed, vector, model)
 	if err != nil {
 		return nil, s.wrapFactError("facts", q.Scope, err)
 	}
