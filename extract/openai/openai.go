@@ -132,6 +132,7 @@ type chatRequest struct {
 	Model          string        `json:"model"`
 	Messages       []chatMessage `json:"messages"`
 	Temperature    float64       `json:"temperature"`
+	TopP           float64       `json:"top_p"`
 	MaxTokens      int           `json:"max_completion_tokens,omitempty"`
 	ResponseFormat any           `json:"response_format"`
 }
@@ -145,14 +146,42 @@ type chatResponse struct {
 	Choices []struct {
 		FinishReason string `json:"finish_reason"`
 		Message      struct {
-			Content string `json:"content"`
-			Refusal string `json:"refusal"`
+			Content messageText `json:"content"`
+			Refusal string      `json:"refusal"`
 		} `json:"message"`
 	} `json:"choices"`
 	Error *struct {
 		Message string `json:"message"`
 		Type    string `json:"type"`
 	} `json:"error"`
+}
+
+// messageText is a reply's content. It is a string from most endpoints, and a
+// list of typed parts from a model that reasons before it answers, where the
+// answer is the parts of type "text" and the rest is the reasoning.
+type messageText string
+
+func (m *messageText) UnmarshalJSON(data []byte) error {
+	var text string
+	if err := json.Unmarshal(data, &text); err == nil {
+		*m = messageText(text)
+		return nil
+	}
+	var parts []struct {
+		Type string `json:"type"`
+		Text string `json:"text"`
+	}
+	if err := json.Unmarshal(data, &parts); err != nil {
+		return fmt.Errorf("content is neither a string nor a list of parts: %w", err)
+	}
+	var b strings.Builder
+	for _, part := range parts {
+		if part.Type == "text" {
+			b.WriteString(part.Text)
+		}
+	}
+	*m = messageText(b.String())
+	return nil
 }
 
 // Complete sends one extraction and returns the message content, which strict
@@ -174,11 +203,14 @@ func (c *Completer) Complete(ctx context.Context, p extract.Prompt) ([]byte, err
 			{Role: "user", Content: p.User},
 		},
 		// Zero, and not configurable. A reclaimed lease replays a job, and an
-		// extractor that answers differently the second time asserts the same
-		// claim over an overlapping window -- ErrFactConflict, not a merged
-		// answer.
+		// extractor that answers differently the second time dates the same
+		// claim differently, so what is kept depends on which answer landed
+		// first.
 		Temperature: 0,
-		MaxTokens:   c.maxTokens,
+		// Stated, although 1 is the usual default: a provider whose model
+		// defaults to something else refuses temperature zero without it.
+		TopP:      1,
+		MaxTokens: c.maxTokens,
 		ResponseFormat: map[string]any{
 			"type": "json_schema",
 			"json_schema": map[string]any{
