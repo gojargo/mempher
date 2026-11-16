@@ -4,9 +4,9 @@ import (
 	"errors"
 	"testing"
 
-	"github.com/mempher/mempher"
-	"github.com/mempher/mempher/memphertest"
-	"github.com/mempher/mempher/ops"
+	"github.com/gojargo/mempher"
+	"github.com/gojargo/mempher/memphertest"
+	"github.com/gojargo/mempher/ops"
 )
 
 // Erasure through the public API, against a real PostgreSQL 18. It is the one

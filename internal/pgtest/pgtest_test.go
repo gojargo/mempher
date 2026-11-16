@@ -3,7 +3,7 @@ package pgtest_test
 import (
 	"testing"
 
-	"github.com/mempher/mempher/internal/pgtest"
+	"github.com/gojargo/mempher/internal/pgtest"
 )
 
 // TestPoolProvidesTheDatabaseTheSchemaNeeds checks the three things the

@@ -10,12 +10,12 @@ import (
 	"testing"
 	"time"
 
-	"github.com/mempher/mempher"
-	"github.com/mempher/mempher/embed/openai"
-	"github.com/mempher/mempher/eval"
-	"github.com/mempher/mempher/internal/pgtest"
-	"github.com/mempher/mempher/memphertest"
-	"github.com/mempher/mempher/postgres"
+	"github.com/gojargo/mempher"
+	"github.com/gojargo/mempher/embed/openai"
+	"github.com/gojargo/mempher/eval"
+	"github.com/gojargo/mempher/internal/pgtest"
+	"github.com/gojargo/mempher/memphertest"
+	"github.com/gojargo/mempher/postgres"
 )
 
 // dims is the width of the stand-in embedder. Nothing measured here reads a

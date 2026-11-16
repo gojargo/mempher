@@ -8,9 +8,9 @@ import (
 	"testing"
 	"time"
 
-	"github.com/mempher/mempher"
-	"github.com/mempher/mempher/ops"
-	"github.com/mempher/mempher/postgres"
+	"github.com/gojargo/mempher"
+	"github.com/gojargo/mempher/ops"
+	"github.com/gojargo/mempher/postgres"
 )
 
 // seedScope appends one episode so a scope exists to enqueue against, and returns

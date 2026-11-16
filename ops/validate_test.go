@@ -6,7 +6,7 @@ import (
 	"testing"
 	"time"
 
-	"github.com/mempher/mempher"
+	"github.com/gojargo/mempher"
 )
 
 func TestJobQueryValidate(t *testing.T) {

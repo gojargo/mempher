@@ -11,8 +11,8 @@ import (
 	"testing"
 	"time"
 
-	"github.com/mempher/mempher"
-	"github.com/mempher/mempher/extract"
+	"github.com/gojargo/mempher"
+	"github.com/gojargo/mempher/extract"
 )
 
 type request struct {

@@ -6,8 +6,8 @@ import (
 	"testing"
 	"time"
 
-	"github.com/mempher/mempher"
-	"github.com/mempher/mempher/postgres"
+	"github.com/gojargo/mempher"
+	"github.com/gojargo/mempher/postgres"
 )
 
 // seed appends an episode and encodes it with v, which is what a worker would do.

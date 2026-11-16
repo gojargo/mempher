@@ -21,9 +21,9 @@ import (
 	"time"
 
 	"github.com/jackc/pgx/v5/pgxpool"
-	"github.com/mempher/mempher"
-	"github.com/mempher/mempher/memphertest"
-	"github.com/mempher/mempher/postgres"
+	"github.com/gojargo/mempher"
+	"github.com/gojargo/mempher/memphertest"
+	"github.com/gojargo/mempher/postgres"
 )
 
 const scope = "user:8123"

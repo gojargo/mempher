@@ -5,11 +5,11 @@ import (
 	"testing"
 	"time"
 
-	"github.com/mempher/mempher"
-	"github.com/mempher/mempher/internal/pgtest"
-	"github.com/mempher/mempher/memphertest"
-	"github.com/mempher/mempher/ops"
-	"github.com/mempher/mempher/postgres"
+	"github.com/gojargo/mempher"
+	"github.com/gojargo/mempher/internal/pgtest"
+	"github.com/gojargo/mempher/memphertest"
+	"github.com/gojargo/mempher/ops"
+	"github.com/gojargo/mempher/postgres"
 )
 
 // L1 through the public API, against a real PostgreSQL 18. The temporal

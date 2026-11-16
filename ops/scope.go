@@ -5,7 +5,7 @@ package ops
 import (
 	"time"
 
-	"github.com/mempher/mempher"
+	"github.com/gojargo/mempher"
 )
 
 // Scope is one partition of L0 as the catalogue holds it: its identity, how far

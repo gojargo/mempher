@@ -5,7 +5,7 @@ package ops
 import (
 	"fmt"
 
-	"github.com/mempher/mempher"
+	"github.com/gojargo/mempher"
 )
 
 // Validate reports whether the query can list jobs. A [Queue] calls it, so

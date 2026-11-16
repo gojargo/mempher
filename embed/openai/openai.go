@@ -31,7 +31,7 @@ import (
 	"slices"
 	"strings"
 
-	"github.com/mempher/mempher"
+	"github.com/gojargo/mempher"
 )
 
 // Defaults, used when the corresponding [Config] field is zero.

@@ -7,7 +7,7 @@ import (
 	"strings"
 	"time"
 
-	"github.com/mempher/mempher"
+	"github.com/gojargo/mempher"
 )
 
 // extractionSystem is the standing instruction for the call that produces facts.

@@ -4,7 +4,7 @@ import (
 	"math"
 	"testing"
 
-	"github.com/mempher/mempher"
+	"github.com/gojargo/mempher"
 )
 
 // recollection builds a result whose episodes carry the given sequence

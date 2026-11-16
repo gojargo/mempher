@@ -7,8 +7,8 @@ import (
 	"testing"
 	"time"
 
-	"github.com/mempher/mempher"
-	"github.com/mempher/mempher/memphertest"
+	"github.com/gojargo/mempher"
+	"github.com/gojargo/mempher/memphertest"
 )
 
 func cosine(t *testing.T, a, b mempher.Vector) float64 {

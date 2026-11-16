@@ -9,7 +9,7 @@ import (
 	"strings"
 	"time"
 
-	"github.com/mempher/mempher"
+	"github.com/gojargo/mempher"
 )
 
 // score grades one recollection against a question's labels.

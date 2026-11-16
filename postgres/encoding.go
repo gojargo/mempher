@@ -10,8 +10,8 @@ import (
 	"strings"
 
 	"github.com/google/uuid"
-	"github.com/mempher/mempher"
-	"github.com/mempher/mempher/ops"
+	"github.com/gojargo/mempher"
+	"github.com/gojargo/mempher/ops"
 )
 
 // DefaultPendingEncodingsLimit is how many ids [Store.PendingEncodings] returns

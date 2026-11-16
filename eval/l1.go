@@ -11,7 +11,7 @@ import (
 	"time"
 	"unicode"
 
-	"github.com/mempher/mempher"
+	"github.com/gojargo/mempher"
 )
 
 // L1Config assembles a fact-extraction run.

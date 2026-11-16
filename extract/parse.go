@@ -9,7 +9,7 @@ import (
 	"strings"
 	"time"
 
-	"github.com/mempher/mempher"
+	"github.com/gojargo/mempher"
 )
 
 // extraction is a reply to the extraction call, in the shape the schema asks

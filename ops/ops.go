@@ -17,7 +17,7 @@ import (
 	"fmt"
 	"time"
 
-	"github.com/mempher/mempher"
+	"github.com/gojargo/mempher"
 )
 
 // Store is what operating a mempher deployment needs of its backend: the

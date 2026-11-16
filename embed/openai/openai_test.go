@@ -9,7 +9,7 @@ import (
 	"strings"
 	"testing"
 
-	"github.com/mempher/mempher"
+	"github.com/gojargo/mempher"
 )
 
 type request struct {

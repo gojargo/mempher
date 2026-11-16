@@ -8,7 +8,7 @@ import (
 	"iter"
 	"time"
 
-	"github.com/mempher/mempher"
+	"github.com/gojargo/mempher"
 )
 
 // Question is one labelled retrieval task.

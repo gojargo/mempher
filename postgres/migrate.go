@@ -13,7 +13,7 @@ import (
 	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgconn"
 	"github.com/jackc/pgx/v5/pgxpool"
-	"github.com/mempher/mempher"
+	"github.com/gojargo/mempher"
 )
 
 // Schema is the single PostgreSQL schema mempher owns, so it installs beside an

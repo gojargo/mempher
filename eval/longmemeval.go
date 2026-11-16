@@ -11,7 +11,7 @@ import (
 	"strings"
 	"time"
 
-	"github.com/mempher/mempher"
+	"github.com/gojargo/mempher"
 )
 
 // longMemEvalDate is how the benchmark writes an instant: "2023/05/30 (Tue) 23:40".

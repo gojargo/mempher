@@ -14,8 +14,8 @@ import (
 	"github.com/google/uuid"
 	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgtype"
-	"github.com/mempher/mempher"
-	"github.com/mempher/mempher/ops"
+	"github.com/gojargo/mempher"
+	"github.com/gojargo/mempher/ops"
 )
 
 // Defaults used when the corresponding query field is left zero.

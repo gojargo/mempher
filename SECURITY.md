@@ -3,7 +3,7 @@
 ## Reporting a vulnerability
 
 Report it privately, through
-[GitHub's advisory form](https://github.com/mempher/mempher/security/advisories/new).
+[GitHub's advisory form](https://github.com/gojargo/mempher/security/advisories/new).
 Please do not open a public issue for one.
 
 Include the version, what an attacker gets, and the smallest way to reproduce

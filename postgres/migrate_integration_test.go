@@ -9,9 +9,9 @@ import (
 	"time"
 
 	"github.com/jackc/pgx/v5/pgxpool"
-	"github.com/mempher/mempher"
-	"github.com/mempher/mempher/internal/pgtest"
-	"github.com/mempher/mempher/postgres"
+	"github.com/gojargo/mempher"
+	"github.com/gojargo/mempher/internal/pgtest"
+	"github.com/gojargo/mempher/postgres"
 )
 
 // testDimensions is deliberately tiny: HNSW is happy with it, and every test

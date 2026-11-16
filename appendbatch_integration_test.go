@@ -7,8 +7,8 @@ import (
 	"sync"
 	"testing"
 
-	"github.com/mempher/mempher"
-	"github.com/mempher/mempher/ops"
+	"github.com/gojargo/mempher"
+	"github.com/gojargo/mempher/ops"
 )
 
 // AppendBatch through the public API. What it has to preserve is everything

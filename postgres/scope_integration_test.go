@@ -5,9 +5,9 @@ import (
 	"strings"
 	"testing"
 
-	"github.com/mempher/mempher"
-	"github.com/mempher/mempher/ops"
-	"github.com/mempher/mempher/postgres"
+	"github.com/gojargo/mempher"
+	"github.com/gojargo/mempher/ops"
+	"github.com/gojargo/mempher/postgres"
 )
 
 // appendN appends n episodes to a scope, so that its last_seq is known.

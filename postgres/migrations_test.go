@@ -6,7 +6,7 @@ import (
 	"testing"
 	"time"
 
-	"github.com/mempher/mempher"
+	"github.com/gojargo/mempher"
 )
 
 // TestLoadMigrations checks the embedded set is well formed. It runs on every

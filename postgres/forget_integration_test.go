@@ -8,7 +8,7 @@ import (
 
 	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgxpool"
-	"github.com/mempher/mempher"
+	"github.com/gojargo/mempher"
 )
 
 // The guard 0004 installed, tested at the level it lives at. What the library

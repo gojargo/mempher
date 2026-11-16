@@ -5,7 +5,7 @@ package ops
 import (
 	"time"
 
-	"github.com/mempher/mempher"
+	"github.com/gojargo/mempher"
 )
 
 // JobQuery lists jobs, oldest first.

@@ -7,12 +7,12 @@
 **Long-term memory for AI agents, in Go.**
 
 ![Status](https://img.shields.io/badge/status-in%20development-orange)
-[![CI](https://github.com/mempher/mempher/actions/workflows/ci.yml/badge.svg)](https://github.com/mempher/mempher/actions/workflows/ci.yml)
-[![Coverage](https://codecov.io/gh/mempher/mempher/graph/badge.svg)](https://codecov.io/gh/mempher/mempher)
-[![Go Reference](https://pkg.go.dev/badge/github.com/mempher/mempher.svg)](https://pkg.go.dev/github.com/mempher/mempher)
-[![OpenSSF Scorecard](https://api.securityscorecards.dev/projects/github.com/mempher/mempher/badge)](https://securityscorecards.dev/viewer/?uri=github.com/mempher/mempher)
-![Go version](https://img.shields.io/github/go-mod/go-version/mempher/mempher)
-[![Release](https://img.shields.io/github/v/release/mempher/mempher?sort=semver)](https://github.com/mempher/mempher/releases)
+[![CI](https://github.com/gojargo/mempher/actions/workflows/ci.yml/badge.svg)](https://github.com/gojargo/mempher/actions/workflows/ci.yml)
+[![Coverage](https://codecov.io/gh/gojargo/mempher/graph/badge.svg)](https://codecov.io/gh/gojargo/mempher)
+[![Go Reference](https://pkg.go.dev/badge/github.com/gojargo/mempher.svg)](https://pkg.go.dev/github.com/gojargo/mempher)
+[![OpenSSF Scorecard](https://api.securityscorecards.dev/projects/github.com/gojargo/mempher/badge)](https://securityscorecards.dev/viewer/?uri=github.com/gojargo/mempher)
+![Go version](https://img.shields.io/github/go-mod/go-version/gojargo/mempher)
+[![Release](https://img.shields.io/github/v/release/gojargo/mempher?sort=semver)](https://github.com/gojargo/mempher/releases)
 [![License: Apache-2.0](https://img.shields.io/badge/license-Apache--2.0-blue.svg)](LICENSE)
 
 </div>
@@ -192,7 +192,7 @@ what each contributed, so a thin result is never mistaken for an empty memory.
 Two ports, and they cost very different amounts of work.
 
 `Embedder` is the easy one, and
-[`mempher/embed/openai`](https://pkg.go.dev/github.com/mempher/mempher/embed/openai)
+[`mempher/embed/openai`](https://pkg.go.dev/github.com/gojargo/mempher/embed/openai)
 covers it against any OpenAI-compatible embeddings endpoint — which is most of
 them, local servers included.
 
@@ -216,7 +216,7 @@ it, and every reply is checked against it — a model swapped for one of another
 size is caught at the call rather than at a constraint three statements later.
 
 `Extractor` is the hard one, and
-[`mempher/extract`](https://pkg.go.dev/github.com/mempher/mempher/extract) ships
+[`mempher/extract`](https://pkg.go.dev/github.com/gojargo/mempher/extract) ships
 it working. It owns the prompt, the response schema and the validation that
 decides what a `FactStore` will accept — the part that is a prompt rather than a
 schema, and the part most likely to be wrong.
@@ -304,7 +304,7 @@ claim, the next extraction re-derives it.
 ## Operating it
 
 Everything you need to run mempher in production, and nothing you need to use it,
-lives in [`mempher/ops`](https://pkg.go.dev/github.com/mempher/mempher/ops):
+lives in [`mempher/ops`](https://pkg.go.dev/github.com/gojargo/mempher/ops):
 
 ```go
 o, err := ops.New(ops.Config{Store: store, Embedder: myEmbedder})
@@ -392,7 +392,7 @@ measures whether the evidence was in the context at all, which is the part a
 memory layer is responsible for.
 
 Reproduce with `make eval LONGMEMEVAL=/path/to/longmemeval_s`, and see
-[`mempher/eval`](https://pkg.go.dev/github.com/mempher/mempher/eval) for the
+[`mempher/eval`](https://pkg.go.dev/github.com/gojargo/mempher/eval) for the
 harness. It ingests each haystack once and scores every channel configuration
 against it, so comparing three is not three times the work.
 

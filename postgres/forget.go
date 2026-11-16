@@ -7,7 +7,7 @@ import (
 	"fmt"
 
 	"github.com/google/uuid"
-	"github.com/mempher/mempher"
+	"github.com/gojargo/mempher"
 )
 
 // erasureDeclaration is how this transaction tells the append-only trigger that

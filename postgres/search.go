@@ -13,7 +13,7 @@ import (
 	"strings"
 
 	"github.com/jackc/pgx/v5"
-	"github.com/mempher/mempher"
+	"github.com/gojargo/mempher"
 )
 
 // episodeColumnsQualified is [episodeColumns] with the alias the search joins use.

@@ -4,7 +4,7 @@ import (
 	"sync"
 	"time"
 
-	"github.com/mempher/mempher"
+	"github.com/gojargo/mempher"
 )
 
 // Clock is a [mempher.Clock] that only moves when you move it, so episodes can

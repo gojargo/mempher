@@ -9,7 +9,7 @@ import (
 	"sync"
 	"unicode"
 
-	"github.com/mempher/mempher"
+	"github.com/gojargo/mempher"
 )
 
 // Embedder is a deterministic [mempher.Embedder] that needs no model provider.

@@ -24,8 +24,8 @@ import (
 	"os"
 	"strings"
 
-	"github.com/mempher/mempher"
-	"github.com/mempher/mempher/extract"
+	"github.com/gojargo/mempher"
+	"github.com/gojargo/mempher/extract"
 )
 
 // Defaults, used when the corresponding [Config] field is zero.

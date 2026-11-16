@@ -6,8 +6,8 @@ import (
 	"log"
 	"time"
 
-	"github.com/mempher/mempher"
-	"github.com/mempher/mempher/extract"
+	"github.com/gojargo/mempher"
+	"github.com/gojargo/mempher/extract"
 )
 
 // provider stands in for the adapter you write: about twenty lines handing a

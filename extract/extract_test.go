@@ -12,7 +12,7 @@ import (
 	"testing"
 	"time"
 
-	"github.com/mempher/mempher"
+	"github.com/gojargo/mempher"
 )
 
 // fake is a [Completer] that returns canned replies and records what it was

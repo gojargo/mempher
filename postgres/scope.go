@@ -7,7 +7,7 @@ import (
 	"fmt"
 	"strings"
 
-	"github.com/mempher/mempher/ops"
+	"github.com/gojargo/mempher/ops"
 )
 
 // DefaultScopesLimit is how many scopes [Store.Scopes] returns when a query does

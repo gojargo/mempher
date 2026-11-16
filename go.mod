@@ -1,4 +1,4 @@
-module github.com/mempher/mempher
+module github.com/gojargo/mempher
 
 go 1.27.0
 

@@ -8,7 +8,7 @@
 // honest about the word "compatible": the endpoint is a base URL you set, not a
 // provider a vendor's client assumes.
 //
-//	go get github.com/mempher/mempher/extract/openai
+//	go get github.com/gojargo/mempher/extract/openai
 //
 // Structured output goes through response_format json_schema in strict mode,
 // which is the only setting under which the predicate vocabulary is genuinely
@@ -26,8 +26,8 @@ import (
 	"slices"
 	"strings"
 
-	"github.com/mempher/mempher"
-	"github.com/mempher/mempher/extract"
+	"github.com/gojargo/mempher"
+	"github.com/gojargo/mempher/extract"
 )
 
 // DefaultBaseURL is OpenAI's own endpoint, used when [Config] names none.

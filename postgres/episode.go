@@ -10,7 +10,7 @@ import (
 
 	"github.com/google/uuid"
 	"github.com/jackc/pgx/v5"
-	"github.com/mempher/mempher"
+	"github.com/gojargo/mempher"
 )
 
 // episodeColumns is the read shape of an episode, in the order scanEpisode

@@ -6,7 +6,7 @@ import (
 	"encoding/json"
 	"fmt"
 
-	"github.com/mempher/mempher"
+	"github.com/gojargo/mempher"
 )
 
 // jsonSchema is the subset of JSON Schema every provider's structured-output

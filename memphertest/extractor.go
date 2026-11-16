@@ -6,7 +6,7 @@ import (
 	"strings"
 	"sync"
 
-	"github.com/mempher/mempher"
+	"github.com/gojargo/mempher"
 )
 
 // Rule is one thing an [Extractor] knows how to notice.
