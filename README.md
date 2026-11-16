@@ -101,7 +101,7 @@ worker drained 6 jobs -- now searchable semantically, and facts exist
 query: "allergic to hazelnuts"
   fact     the user is allergic to hazelnuts  [since 2019-05-10, still true]
   fact     the user lives in Paris  [since 2019-04-01, still true]
-  episode  0.0328  "I'm allergic to hazelnuts, so no Nutella."  via lexical+semantic
+  episode  0.0205  "I'm allergic to hazelnuts, so no Nutella."  via lexical+semantic
   episode  0.0161  "I moved to Paris last spring."  via semantic
 
 ---- after moving to Berlin ----
@@ -123,7 +123,7 @@ for 2020, bounded by exactly when it stopped being true.
 | --- | --- | --- | --- |
 | **Write** | hot path, one round trip | none | insert one episode, capture its binding, enqueue the work it implies |
 | **Consolidate** | offline, batched, replayable | all of them | drain the queue: embed episodes, extract facts; idempotent, so retries are free |
-| **Read** | synchronous | one, to embed the query | parallel channels → reciprocal rank fusion over episodes, validity filter over facts → token budget → results with provenance |
+| **Read** | synchronous, one round trip after the embedding | one, to embed the query | channels → reciprocal rank fusion over episodes, validity filter over facts → token budget → results with provenance, all in one SQL call |
 
 ## Usage
 
@@ -186,6 +186,46 @@ because the `tsvector` is a generated column. It becomes **semantically**
 searchable once a worker encodes it, and has yielded whatever **facts** it holds
 once a worker extracts it. Recall fuses whichever channels answered and reports
 what each contributed, so a thin result is never mistaken for an empty memory.
+
+## The SQL API
+
+Every rule mempher enforces runs in PostgreSQL, as functions in the `mempher`
+schema. The Go package calls them, and so can anything else that speaks SQL: a
+service in another language gets the same memory, with the same validation and
+the same guarantees, without going through Go.
+
+```sql
+SELECT * FROM mempher.append('user:8123',
+  '[{"content": "I''m allergic to hazelnuts.", "role": "user", "source": "cli"}]',
+  p_jobs := ARRAY['encode', 'extract']);
+
+SELECT mempher.recall('user:8123', 'any food allergies?',
+  p_embedding := $1, p_model := 'text-embedding-3-small',
+  p_extractor := 'mempher-extract/v1+claude-opus-5+a3f9c1e2',
+  p_max_tokens := 2000);
+```
+
+| Function | Does |
+| --- | --- |
+| `append` | write 1 to 64 episodes of a scope and queue the jobs they imply, atomically |
+| `recall` | run the channels, fuse, read the facts, spend the budget; returns one JSON document |
+| `lease_jobs`, `succeed_job`, `fail_job`, `reclaim_jobs` | run the queue: leases, attempts, backoff, dead jobs |
+| `put_encodings` | write a worker's vectors |
+| `apply_extraction` | write a worker's extraction: assertions, retractions, read markers |
+| `search_facts` | read L1 as of an instant |
+| `forget` | erase a scope or some of its episodes, with everything derived from them |
+| `enqueue`, `retry_job`, `purge_jobs`, `job_stats`, `pending_episodes` | operate the queue and find work L0 still implies |
+
+A worker in any language is a loop: `lease_jobs`, read the episodes, call a
+model, then `put_encodings` or `apply_extraction`, then `succeed_job` or
+`fail_job`. The queue decides everything else.
+
+A caller's mistake raises a SQLSTATE in class `MP` (`MP001` an invalid scope,
+`MP020` not found, `MP023` a lease the worker no longer holds, and so on); the
+full list is at the top of
+[`0005_api_append.sql`](postgres/migrations/0005_api_append.sql). The Go
+package maps each code back to its sentinel error. Tables can be read directly;
+writing to them is the functions' job.
 
 ## Where the models plug in
 

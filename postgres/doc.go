@@ -14,5 +14,13 @@
 // than assumed, because a ::vector cast fails outright when the extension's
 // schema is off the search_path.
 //
+// Since migration 0005 the schema carries a SQL API, and [Store] is a thin
+// client of it: each method is one call to a function such as mempher.append,
+// mempher.lease_jobs, mempher.apply_extraction or mempher.recall, which
+// validates its own input and raises a documented SQLSTATE in class MP for a
+// caller's mistake. [Store] maps those codes back to the mempher package's
+// sentinels, so errors.Is works as it always did. The functions are listed,
+// with their contract, at the top of 0005_api_append.sql and in the README.
+//
 // Migrations are embedded, forward-only and rendered as templates. See [Migrate].
 package postgres
