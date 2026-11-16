@@ -19,21 +19,43 @@ import (
 // when a query does not say.
 const DefaultPendingEncodingsLimit = 100
 
-// PutEncoding writes one encoding, replacing any existing one for the same
-// episode and model, through mempher.put_encodings, which takes the encoding's
-// scope and ingest time from the episode row rather than from the caller.
-func (s *Store) PutEncoding(ctx context.Context, enc mempher.Encoding) error {
-	if err := s.validateEncoding(enc); err != nil {
-		return err
+// PutEncodings writes a batch of encodings in one statement, replacing any
+// that exist for the same episode and model. The batch shares one Model and one
+// EncodedAt, because mempher.put_encodings takes one of each.
+func (s *Store) PutEncodings(ctx context.Context, encodings []mempher.Encoding) error {
+	if len(encodings) == 0 {
+		return nil
+	}
+	first := encodings[0]
+	episodes := make([]uuid.UUID, len(encodings))
+	vectors := make([]string, len(encodings))
+	surprise := make([]float32, len(encodings))
+	for i, enc := range encodings {
+		if err := s.validateEncoding(enc); err != nil {
+			return err
+		}
+		if enc.Model != first.Model || !enc.EncodedAt.Equal(first.EncodedAt) {
+			return fmt.Errorf(
+				"mempher/postgres: put encodings: encoding %d differs in Model or EncodedAt from the first: %w",
+				i, mempher.ErrInvalidConfig)
+		}
+		episodes[i] = uuid.UUID(enc.Episode)
+		vectors[i] = formatVector(enc.Vector)
+		surprise[i] = enc.Surprise
 	}
 	err := s.exec(ctx,
 		fmt.Sprintf(`SELECT mempher.put_encodings($1, $2, $3::%s[], $4, $5)`, s.vectorType),
-		string(enc.Model), []uuid.UUID{uuid.UUID(enc.Episode)},
-		[]string{formatVector(enc.Vector)}, enc.EncodedAt, []float32{enc.Surprise})
+		string(first.Model), episodes, vectors, first.EncodedAt, surprise)
 	if err != nil {
-		return apiError(fmt.Sprintf("put encoding for episode %s", enc.Episode), err)
+		return apiError(fmt.Sprintf("put %d encodings", len(encodings)), err)
 	}
 	return nil
+}
+
+// PutEncoding writes one encoding. It is [Store.PutEncodings] for a batch of
+// one.
+func (s *Store) PutEncoding(ctx context.Context, enc mempher.Encoding) error {
+	return s.PutEncodings(ctx, []mempher.Encoding{enc})
 }
 
 // validateEncoding rejects what pgvector or a CHECK would reject anyway, with an
