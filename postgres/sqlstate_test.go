@@ -24,12 +24,12 @@ func TestAPIErrorCodesAreMapped(t *testing.T) {
 		for _, c := range code.FindAllString(m.source, -1) {
 			used[c] = m.filename()
 		}
-		if m.name == "api_append" {
+		if m.name == "init" {
 			contract = m.source
 		}
 	}
 	if contract == "" {
-		t.Fatal("0005_api_append.sql, which documents the contract, is not embedded")
+		t.Fatal("0001_init.sql, which documents the contract, is not embedded")
 	}
 	for c, file := range used {
 		if _, ok := apiErrors[c]; !ok {
@@ -44,7 +44,7 @@ func TestAPIErrorCodesAreMapped(t *testing.T) {
 		}
 	}) {
 		if !strings.Contains(contract, "--     "+c) && !strings.Contains(contract, "  "+c+" ") {
-			t.Errorf("apiErrors maps %s, which 0005_api_append.sql does not document", c)
+			t.Errorf("apiErrors maps %s, which 0001_init.sql does not document", c)
 		}
 	}
 }

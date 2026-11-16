@@ -13,7 +13,7 @@ import (
 
 // apiErrors maps each SQLSTATE in class MP, which the mempher.* functions raise
 // for a caller's mistake, to the sentinel a Go caller tests for. The table is
-// the Go half of the contract listed at the top of 0005_api_append.sql, and
+// the Go half of the contract listed under "The SQL API" in 0001_init.sql, and
 // TestAPIErrorCodesAreMapped keeps the two halves in step.
 var apiErrors = map[string]error{
 	"MP001": mempher.ErrInvalidScope,
