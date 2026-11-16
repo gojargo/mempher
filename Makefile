@@ -39,6 +39,14 @@ eval: ## Retrieval quality against LongMemEval; needs LONGMEMEVAL=/path/to/longm
 		exit 1; }
 	LONGMEMEVAL=$(LONGMEMEVAL) $(GO) test ./eval/ -run LongMemEval -v -count=1 -timeout 60m
 
+.PHONY: qa
+qa: ## End-to-end answers, judged; needs LOCOMO or LONGMEMEVAL, and QA_URL and models (see eval/qa_run_test.go)
+	@test -n "$(LOCOMO)$(LONGMEMEVAL)" || { \
+		echo "set LOCOMO or LONGMEMEVAL to the dataset file, e.g."; \
+		echo "  make qa LOCOMO=~/locomo10.json QA_URL=... QA_ANSWER_MODEL=... QA_EMBED_MODEL=..."; \
+		exit 1; }
+	LOCOMO=$(LOCOMO) LONGMEMEVAL=$(LONGMEMEVAL) $(GO) test ./eval/ -run '^TestQA$$' -v -count=1 -timeout 600m
+
 .PHONY: cover
 cover: ## Every test with a coverage profile, then report the total
 	$(GO) test -race -count=1 -coverprofile=$(COVER) -covermode=atomic $(PKGS)

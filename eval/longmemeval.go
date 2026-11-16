@@ -101,6 +101,7 @@ func (in lmeInstance) question() (Question, error) {
 		Answer: string(in.Answer),
 		Asked:  asked,
 	}
+	q.Grading = lmeGrading(in.QuestionID, in.QuestionType)
 	for i, session := range in.HaystackSessions {
 		if i >= len(in.HaystackDates) {
 			return Question{}, fmt.Errorf("eval: %s: session %d has no date", in.QuestionID, i)
@@ -166,4 +167,32 @@ func (l *loose) UnmarshalJSON(data []byte) error {
 	}
 	*l = loose(strings.Trim(string(data), `"`))
 	return nil
+}
+
+// lmeGrading is what LongMemEval's own evaluation tells its judge for each kind
+// of question, restated. A question whose id ends in _abs has no answer in the
+// haystack, and declining is the correct response.
+func lmeGrading(id, kind string) string {
+	if strings.HasSuffix(id, "_abs") {
+		return "This question cannot be answered from the conversations, and the expected " +
+			"answer explains why. The response is correct only if it recognises that: it " +
+			"says the information is missing or incomplete, or that something else was " +
+			"mentioned but not what is asked. A response that gives an answer is wrong."
+	}
+	switch kind {
+	case "temporal-reasoning":
+		return "Do not penalise an off-by-one error in a count of days, weeks or months: " +
+			"19 days where the expected answer is 18 is correct."
+	case "knowledge-update":
+		return "The expected answer is the most recent value. A response that mentions " +
+			"earlier values as well is correct as long as it gives the expected one as " +
+			"the current answer."
+	case "single-session-preference":
+		return "The expected answer is a rubric describing a good personalised response, " +
+			"not a string to match. The response is correct if it recalls and uses the " +
+			"user's personal information the way the rubric describes. It does not have " +
+			"to cover every point of the rubric."
+	default:
+		return ""
+	}
 }
