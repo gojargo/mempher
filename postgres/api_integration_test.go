@@ -277,3 +277,105 @@ func TestSQLQueue(t *testing.T) {
 		}
 	})
 }
+
+func TestSQLProjections(t *testing.T) {
+	t.Parallel()
+	_, pool := migrated(t)
+	ctx := t.Context()
+
+	var episode string
+	if err := pool.QueryRow(ctx, `
+		SELECT id::text FROM mempher.append('p', '[{"content":"I moved to Paris.","role":"user","source":"s"}]',
+		                                    '2026-01-01T00:00:00Z')`).Scan(&episode); err != nil {
+		t.Fatalf("append: %v", err)
+	}
+	apply := func(assert, retract string) error {
+		return exec(t, pool,
+			`SELECT count(*) FROM mempher.apply_extraction('p', 'x/v1', ARRAY[$1::uuid], $2::jsonb, $3::jsonb, '2026-01-02')`,
+			episode, assert, retract)
+	}
+	paris := `[{"subject":"user","predicate":"lives_in","object":"Paris","statement":"The user lives in Paris.","valid_from":"2026-01-01T00:00:00Z"}]`
+
+	t.Run("applying an extraction twice changes nothing the second time", func(t *testing.T) {
+		if err := apply(paris, `[]`); err != nil {
+			t.Fatalf("first apply: %v", err)
+		}
+		if err := apply(`[{"subject":"user","predicate":"lives_in","object":"Rome","statement":"x","valid_from":"2026-01-01T00:00:00Z"}]`, `[]`); err != nil {
+			t.Fatalf("second apply: %v", err)
+		}
+		var facts int
+		if err := pool.QueryRow(ctx, `SELECT count(*) FROM mempher.facts WHERE scope_id = 'p'`).Scan(&facts); err != nil {
+			t.Fatalf("count: %v", err)
+		}
+		if facts != 1 {
+			t.Errorf("%d facts, want the one the first application wrote", facts)
+		}
+	})
+
+	t.Run("search_facts finds what is true at an instant, and not before", func(t *testing.T) {
+		var now, before int
+		err := pool.QueryRow(ctx, `
+			SELECT (SELECT count(*) FROM mempher.search_facts('p', 'x/v1', '2026-06-01', '2026-06-01', 'where do they live')),
+			       (SELECT count(*) FROM mempher.search_facts('p', 'x/v1', '2025-06-01', '2026-06-01'))`).
+			Scan(&now, &before)
+		if err != nil {
+			t.Fatalf("search_facts: %v", err)
+		}
+		if now != 1 || before != 0 {
+			t.Errorf("true in mid-2026: %d, in mid-2025: %d; want 1 and 0", now, before)
+		}
+	})
+
+	t.Run("rejects", func(t *testing.T) {
+		cases := []struct {
+			name, assert, retract, code string
+		}{
+			{"a predicate with a space", `[{"subject":"u","predicate":"lives in","object":"o","statement":"s","valid_from":"2026-01-01"}]`, `[]`, "MP010"},
+			{"an empty statement", `[{"subject":"u","predicate":"p","object":"o","statement":"  ","valid_from":"2026-01-01"}]`, `[]`, "MP010"},
+			{"a confidence above one", `[{"subject":"u","predicate":"p","object":"o","statement":"s","valid_from":"2026-01-01","confidence":2}]`, `[]`, "MP010"},
+			{"a window that ends as it starts", `[{"subject":"u","predicate":"p","object":"o","statement":"s","valid_from":"2026-01-01","valid_to":"2026-01-01"}]`, `[]`, "MP011"},
+			{"no valid_from", `[{"subject":"u","predicate":"p","object":"o","statement":"s"}]`, `[]`, "MP011"},
+			{"an unknown key", `[{"subject":"u","predicate":"p","object":"o","statement":"s","valid_from":"2026-01-01","since":"x"}]`, `[]`, "MP012"},
+			{"two overlapping windows for one claim", `[
+				{"subject":"u","predicate":"p","object":"o","statement":"s","valid_from":"2026-01-01"},
+				{"subject":"u","predicate":"p","object":"o","statement":"s","valid_from":"2026-02-01"}]`, `[]`, "MP022"},
+			{"a retraction naming no fact", `[]`, `[{"at":"2026-01-01"}]`, "MP012"},
+		}
+		for _, tc := range cases {
+			t.Run(tc.name, func(t *testing.T) {
+				wantSQLState(t, apply(tc.assert, tc.retract), tc.code)
+			})
+		}
+		wantSQLState(t, exec(t, pool,
+			`SELECT mempher.apply_extraction('p', 'x/v1', ARRAY[uuidv7()], '[]', '[]')`), "MP020")
+	})
+
+	t.Run("a retraction before the fact began is refused", func(t *testing.T) {
+		if err := exec(t, pool, `SELECT mempher.append('p2', '[{"content":"c","role":"user","source":"s"}]', '2026-01-01')`); err != nil {
+			t.Fatalf("append: %v", err)
+		}
+		var fact string
+		err := pool.QueryRow(ctx, `
+			SELECT f.id::text FROM mempher.apply_extraction('p2', 'x/v1',
+				(SELECT array_agg(id) FROM mempher.episodes WHERE scope_id = 'p2'),
+				$1::jsonb, '[]', '2026-01-02') f`, paris).Scan(&fact)
+		if err != nil {
+			t.Fatalf("apply: %v", err)
+		}
+		if err := exec(t, pool, `SELECT mempher.append('p2', '[{"content":"d","role":"user","source":"s"}]', '2026-01-03')`); err != nil {
+			t.Fatalf("append: %v", err)
+		}
+		wantSQLState(t, exec(t, pool, `
+			SELECT mempher.apply_extraction('p2', 'x/v1',
+				(SELECT array_agg(id) FROM mempher.episodes WHERE scope_id = 'p2' AND seq = 2),
+				'[]', jsonb_build_array(jsonb_build_object('fact', $1::text, 'at', '2025-01-01')), '2026-01-03')`, fact),
+			"MP011")
+	})
+
+	t.Run("put_encodings checks the width and the episode", func(t *testing.T) {
+		wantSQLState(t, exec(t, pool,
+			`SELECT mempher.put_encodings('m', ARRAY[$1::uuid], ARRAY['[1,2]'::vector])`, episode), "MP021")
+		wantSQLState(t, exec(t, pool,
+			`SELECT mempher.put_encodings('m', ARRAY[$1::uuid], '{}'::vector[])`, episode), "MP013")
+	})
+}

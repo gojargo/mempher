@@ -5,14 +5,15 @@ package postgres
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
-	"slices"
 	"strings"
 	"time"
 
 	"github.com/google/uuid"
 	"github.com/jackc/pgx/v5"
+	"github.com/jackc/pgx/v5/pgconn"
 	"github.com/jackc/pgx/v5/pgtype"
 
 	"github.com/gojargo/mempher"
@@ -37,108 +38,27 @@ const pgerrcodeExclusionViolation = "23P01"
 const factColumns = `id, scope_id, extractor, subject, predicate, object,
 	statement, valid, confidence, episode_ids, asserted_at, updated_at`
 
-// markExtractionSQL records that an extractor read these episodes, and reports
-// both how many of them exist in the scope and how many markers were new.
-//
-// The two counts are what make an extraction idempotent without a second round
-// trip. A short `found` means an episode was named that this scope does not
-// have. A zero `marked` means every one of these episodes had already been read
-// by this extractor, so the extraction it produced is already in the table and
-// applying it again would be at best a no-op and at worst a conflict against
-// itself.
-//
-// scope_id and ingested_at are taken from the episode row for the same reason as
-// in episode_encodings: it makes the pending anti-join a single-table scan, and
-// they cannot drift from an immutable row.
-const markExtractionSQL = `
-WITH found AS (
-    SELECT e.id, e.scope_id, e.ingested_at
-    FROM mempher.episodes e
-    WHERE e.id = ANY($1::uuid[]) AND e.scope_id = $2
-), marked AS (
-    INSERT INTO mempher.fact_extractions
-        (episode_id, extractor, scope_id, ingested_at, fact_count, extracted_at)
-    SELECT found.id, $3, found.scope_id, found.ingested_at, $4, $5
-    FROM found
-    ON CONFLICT (episode_id, extractor) DO NOTHING
-    RETURNING episode_id
-)
-SELECT (SELECT count(*) FROM found), (SELECT count(*) FROM marked)`
+// assertionJSON is one element of mempher.apply_extraction's assert argument.
+type assertionJSON struct {
+	Subject    mempher.Subject   `json:"subject"`
+	Predicate  mempher.Predicate `json:"predicate"`
+	Object     string            `json:"object"`
+	Statement  string            `json:"statement"`
+	ValidFrom  time.Time         `json:"valid_from"`
+	ValidTo    *time.Time        `json:"valid_to,omitempty"`
+	Confidence float32           `json:"confidence"`
+}
 
-// applyAssertionsSQL upserts a batch of claims.
-//
-// It is written as UPDATE-then-INSERT rather than ON CONFLICT because the
-// target is a temporal primary key, which PostgreSQL implements as a GiST
-// exclusion constraint, and ON CONFLICT cannot name one. The UPDATE matches on
-// the full identity including an exact window, so re-asserting the same claim
-// refreshes it and asserting the same claim over a different overlapping window
-// falls through to the INSERT and is rejected by the constraint. That is the
-// intended split: a re-run is free, a contradiction is loud.
-//
-// Provenance accumulates rather than being replaced. A claim two episodes
-// support is evidenced by both, and an update that overwrote episode_ids would
-// quietly narrow the trail back to L0.
-const applyAssertionsSQL = `
-WITH input AS (
-    SELECT * FROM unnest(
-        $3::text[], $4::text[], $5::text[], $6::text[],
-        $7::timestamptz[], $8::timestamptz[], $9::real[]
-    ) AS a(subject, predicate, object, statement, valid_from, valid_to, confidence)
-), updated AS (
-    UPDATE mempher.facts f
-    SET statement   = i.statement,
-        confidence  = i.confidence,
-        episode_ids = (
-            SELECT array_agg(DISTINCT e ORDER BY e)
-            FROM unnest(f.episode_ids || $10::uuid[]) AS e
-        ),
-        updated_at  = $11
-    FROM input i
-    WHERE f.scope_id  = $1
-      AND f.extractor = $2
-      AND f.subject   = i.subject
-      AND f.predicate = i.predicate
-      AND f.object    = i.object
-      AND f.valid     = tstzrange(i.valid_from, i.valid_to, '[)')
-    RETURNING f.subject, f.predicate, f.object
-)
-INSERT INTO mempher.facts
-    (scope_id, extractor, subject, predicate, object, statement, valid,
-     confidence, episode_ids, asserted_at, updated_at)
-SELECT $1, $2, i.subject, i.predicate, i.object, i.statement,
-       tstzrange(i.valid_from, i.valid_to, '[)'), i.confidence, $10::uuid[], $11, $11
-FROM input i
-WHERE NOT EXISTS (
-    SELECT 1 FROM updated u
-    WHERE u.subject = i.subject AND u.predicate = i.predicate AND u.object = i.object
-)`
-
-// retractSQL closes a fact's window at an instant.
-//
-// The guard is what makes a retraction idempotent and keeps it from running
-// backwards: a window already closed at or before that instant is left alone
-// rather than reopened to a later one, and Go reads the row back to tell that
-// case apart from a fact that is simply not there.
-const retractSQL = `
-UPDATE mempher.facts
-SET valid      = tstzrange(lower(valid), $3, '[)'),
-    updated_at = $4
-WHERE id = $1
-  AND scope_id = $2
-  AND lower(valid) < $3
-  AND (upper_inf(valid) OR upper(valid) > $3)`
-
-// factsOfExtractionSQL reads back everything one extraction's episodes support.
-// It answers both paths through ApplyExtraction: the one that just wrote, and
-// the one that found the work already done.
-const factsOfExtractionSQL = `
-SELECT ` + factColumns + `
-FROM mempher.facts
-WHERE scope_id = $1 AND extractor = $2 AND episode_ids && $3::uuid[]
-ORDER BY subject, predicate, object, lower(valid)`
+// retractionJSON is one element of mempher.apply_extraction's retract argument.
+type retractionJSON struct {
+	Fact uuid.UUID `json:"fact"`
+	At   time.Time `json:"at"`
+}
 
 // ApplyExtraction records one extraction atomically: the assertions, the
-// retractions, and the markers saying those episodes were read.
+// retractions and the markers saying which episodes were read. It is one call to
+// mempher.apply_extraction, which also decides what a repeated extraction does
+// (nothing) and when two claims conflict.
 func (s *Store) ApplyExtraction(
 	ctx context.Context,
 	cmd mempher.ExtractCommand,
@@ -146,200 +66,44 @@ func (s *Store) ApplyExtraction(
 	if err := cmd.Validate(); err != nil {
 		return nil, fmt.Errorf("mempher/postgres: apply extraction: %w", err)
 	}
-	assertions, err := dedupeAssertions(cmd.Assert)
-	if err != nil {
-		return nil, err
-	}
-
-	tx, err := s.pool.Begin(ctx)
-	if err != nil {
-		return nil, fmt.Errorf("mempher/postgres: apply extraction: begin: %w", err)
-	}
-	defer func() { _ = tx.Rollback(ctx) }()
-
-	episodes := make([]uuid.UUID, len(cmd.Episodes))
-	for i, id := range cmd.Episodes {
-		episodes[i] = uuid.UUID(id)
-	}
-
-	var found, marked int
-	err = tx.QueryRow(ctx, markExtractionSQL,
-		episodes, string(cmd.Scope), string(cmd.Extractor), len(assertions), cmd.At,
-	).Scan(&found, &marked)
-	if err != nil {
-		return nil, s.wrapFactError("apply extraction", cmd.Scope, err)
-	}
-	if found < len(cmd.Episodes) {
-		return nil, fmt.Errorf(
-			"mempher/postgres: apply extraction: %d of %d episodes are not in scope %q: %w",
-			len(cmd.Episodes)-found, len(cmd.Episodes), cmd.Scope, mempher.ErrNotFound)
-	}
-
-	// A zero marked count means every episode had already been read by this
-	// extractor, so the work is done and replaying it would at best change
-	// nothing. Skipping is what makes a reclaimed job free, which is what
-	// at-least-once leasing needs from every job body.
-	if marked > 0 {
-		if err := applyRetractions(ctx, tx, cmd); err != nil {
-			return nil, err
+	assertions := make([]assertionJSON, len(cmd.Assert))
+	for i, a := range cmd.Assert {
+		assertions[i] = assertionJSON{
+			Subject:    a.Subject,
+			Predicate:  a.Predicate,
+			Object:     a.Object,
+			Statement:  a.Statement,
+			ValidFrom:  a.Valid.From.Truncate(time.Microsecond),
+			Confidence: a.Confidence,
 		}
-		if err := s.applyAssertions(ctx, tx, cmd, assertions, episodes); err != nil {
-			return nil, err
+		if !a.Valid.IsOpen() {
+			to := a.Valid.To.Truncate(time.Microsecond)
+			assertions[i].ValidTo = &to
 		}
 	}
-
-	facts, err := scanFacts(ctx, tx, factsOfExtractionSQL,
-		string(cmd.Scope), string(cmd.Extractor), episodes)
+	retractions := make([]retractionJSON, len(cmd.Retract))
+	for i, r := range cmd.Retract {
+		retractions[i] = retractionJSON{Fact: uuid.UUID(r.Fact), At: r.At.Truncate(time.Microsecond)}
+	}
+	assertPayload, err := json.Marshal(assertions)
+	if err != nil {
+		return nil, fmt.Errorf("mempher/postgres: apply extraction: encode assertions: %w", err)
+	}
+	retractPayload, err := json.Marshal(retractions)
+	if err != nil {
+		return nil, fmt.Errorf("mempher/postgres: apply extraction: encode retractions: %w", err)
+	}
+	facts, err := scanFacts(ctx, s.pool,
+		`SELECT `+factColumns+` FROM mempher.apply_extraction($1, $2, $3, $4::jsonb, $5::jsonb, $6)`,
+		string(cmd.Scope), string(cmd.Extractor), episodeUUIDs(cmd.Episodes),
+		assertPayload, retractPayload, cmd.At)
 	if err != nil {
 		return nil, s.wrapFactError("apply extraction", cmd.Scope, err)
-	}
-	if err := tx.Commit(ctx); err != nil {
-		return nil, fmt.Errorf("mempher/postgres: apply extraction: commit: %w", err)
 	}
 	return facts, nil
 }
 
-// applyAssertions writes the batch of claims, translating the constraint that
-// catches a self-contradicting extraction into its sentinel.
-func (s *Store) applyAssertions(
-	ctx context.Context,
-	tx pgx.Tx,
-	cmd mempher.ExtractCommand,
-	assertions []mempher.Assertion,
-	episodes []uuid.UUID,
-) error {
-	if len(assertions) == 0 {
-		return nil
-	}
-
-	n := len(assertions)
-	subjects := make([]string, n)
-	predicates := make([]string, n)
-	objects := make([]string, n)
-	statements := make([]string, n)
-	from := make([]time.Time, n)
-	to := make([]*time.Time, n)
-	confidence := make([]float32, n)
-	for i, a := range assertions {
-		subjects[i] = string(a.Subject)
-		predicates[i] = string(a.Predicate)
-		objects[i] = a.Object
-		statements[i] = a.Statement
-		from[i] = a.Valid.From
-		// A NULL upper bound is an unbounded one: the claim is still true.
-		if !a.Valid.IsOpen() {
-			upper := a.Valid.To
-			to[i] = &upper
-		}
-		confidence[i] = a.Confidence
-	}
-
-	_, err := tx.Exec(ctx, applyAssertionsSQL,
-		string(cmd.Scope), string(cmd.Extractor),
-		subjects, predicates, objects, statements, from, to, confidence,
-		episodes, cmd.At)
-	if err != nil {
-		return s.wrapFactError("apply extraction", cmd.Scope, err)
-	}
-	return nil
-}
-
-// applyRetractions closes the windows an extraction contradicted.
-//
-// Each is checked rather than fired and forgotten, because a retraction naming a
-// fact that is not there, or an instant before the fact began, means the
-// extractor is working from a view of the scope that no longer holds -- and
-// silently dropping it would leave two claims standing that cannot both be true.
-func applyRetractions(ctx context.Context, tx pgx.Tx, cmd mempher.ExtractCommand) error {
-	for _, r := range cmd.Retract {
-		tag, err := tx.Exec(ctx, retractSQL,
-			uuid.UUID(r.Fact), string(cmd.Scope), r.At, cmd.At)
-		if err != nil {
-			return fmt.Errorf("mempher/postgres: apply extraction: retract fact %s: %w",
-				r.Fact, err)
-		}
-		if tag.RowsAffected() > 0 {
-			continue
-		}
-		if err := explainRetraction(ctx, tx, cmd.Scope, r); err != nil {
-			return err
-		}
-	}
-	return nil
-}
-
-// explainRetraction says why a retraction changed nothing: the fact is absent,
-// the instant precedes its start, or it was already closed by then. Only the
-// last of those is acceptable, and only because a retried job must be free.
-func explainRetraction(
-	ctx context.Context,
-	tx pgx.Tx,
-	scope mempher.ScopeID,
-	r mempher.Retraction,
-) error {
-	var lower time.Time
-	var upper *time.Time
-	err := tx.QueryRow(ctx,
-		`SELECT lower(valid), upper(valid) FROM mempher.facts WHERE id = $1 AND scope_id = $2`,
-		uuid.UUID(r.Fact), string(scope)).Scan(&lower, &upper)
-	switch {
-	case errors.Is(err, pgx.ErrNoRows):
-		return fmt.Errorf("mempher/postgres: apply extraction: retract fact %s in scope %q: %w",
-			r.Fact, scope, mempher.ErrNotFound)
-	case err != nil:
-		return fmt.Errorf("mempher/postgres: apply extraction: read fact %s: %w", r.Fact, err)
-	}
-	if !r.At.After(lower) {
-		return fmt.Errorf(
-			"mempher/postgres: apply extraction: fact %s stops being true at %s, "+
-				"but only became true at %s: %w",
-			r.Fact, r.At.UTC().Format(time.RFC3339), lower.UTC().Format(time.RFC3339),
-			mempher.ErrInvalidValidity)
-	}
-	// Already closed at or before this instant: the retraction has been applied
-	// before, which is exactly what a reclaimed job replays.
-	return nil
-}
-
-// dedupeAssertions drops exact repeats and rejects a batch that contradicts
-// itself over the same claim.
-//
-// Both are the extractor's mistakes, and both would otherwise arrive as one
-// opaque constraint violation from a statement that inserted several rows at
-// once. The same claim twice is a model repeating itself and is simply dropped;
-// the same claim over two different windows is a model disagreeing with itself
-// inside one answer, which nothing downstream can resolve.
-func dedupeAssertions(in []mempher.Assertion) ([]mempher.Assertion, error) {
-	type identity struct {
-		subject   mempher.Subject
-		predicate mempher.Predicate
-		object    string
-	}
-
-	out := make([]mempher.Assertion, 0, len(in))
-	windows := make(map[identity][]mempher.Validity, len(in))
-	for _, a := range in {
-		key := identity{a.Subject, a.Predicate, a.Object}
-		if slices.ContainsFunc(windows[key], func(v mempher.Validity) bool {
-			return v == a.Valid
-		}) {
-			continue
-		}
-		for _, seen := range windows[key] {
-			if seen.Overlaps(a.Valid) {
-				return nil, fmt.Errorf(
-					"mempher/postgres: apply extraction: %q %q %q is asserted over two "+
-						"overlapping windows in one extraction: %w",
-					a.Subject, a.Predicate, a.Object, mempher.ErrFactConflict)
-			}
-		}
-		windows[key] = append(windows[key], a.Valid)
-		out = append(out, a)
-	}
-	return out, nil
-}
-
-// Facts returns the facts matching q.
+// Facts returns the facts matching q, through mempher.search_facts.
 func (s *Store) Facts(ctx context.Context, q mempher.FactQuery) ([]mempher.Fact, error) {
 	if err := q.Validate(); err != nil {
 		return nil, fmt.Errorf("mempher/postgres: facts: %w", err)
@@ -354,63 +118,26 @@ func (s *Store) Facts(ctx context.Context, q mempher.FactQuery) ([]mempher.Fact,
 			"mempher/postgres: facts: At must be resolved by the caller: %w",
 			mempher.ErrInvalidConfig)
 	}
-
-	b := &queryBuilder{}
-	scope := b.arg(string(q.Scope))
-	extractor := b.arg(string(q.Extractor))
-
-	var sql strings.Builder
-	var rank string
-	if strings.TrimSpace(q.Text) != "" {
-		// Ranked, but never filtered: relevance decides which facts survive the
-		// limit, it does not decide which are true. A fact the query does not
-		// mention is still a fact about the scope.
-		rank = fmt.Sprintf("ts_rank_cd(f.statement_tsv, %s)",
-			anyLexemeQuery(b.arg(s.textSearchConfig), b.arg(q.Text)))
-	}
-	fmt.Fprintf(&sql, "SELECT %s\nFROM mempher.facts f\nWHERE f.scope_id = %s AND f.extractor = %s",
-		qualify(factColumns, "f."), scope, extractor)
-
-	fmt.Fprintf(&sql, "\n  AND f.asserted_at <= %s", b.arg(q.AsOf))
-	if q.IncludeClosed {
-		// Everything the scope had begun to believe by then, whether or not it
-		// still holds: the "what was true then" question.
-		fmt.Fprintf(&sql, "\n  AND lower(f.valid) <= %s", b.arg(q.At))
-	} else {
-		fmt.Fprintf(&sql, "\n  AND f.valid @> %s::timestamptz", b.arg(q.At))
-	}
-	if len(q.Subjects) > 0 {
-		subjects := make([]string, len(q.Subjects))
-		for i, subject := range q.Subjects {
-			subjects[i] = string(subject)
-		}
-		fmt.Fprintf(&sql, "\n  AND f.subject = ANY(%s)", b.arg(subjects))
-	}
-	if len(q.Predicates) > 0 {
-		predicates := make([]string, len(q.Predicates))
-		for i, predicate := range q.Predicates {
-			predicates[i] = string(predicate)
-		}
-		fmt.Fprintf(&sql, "\n  AND f.predicate = ANY(%s)", b.arg(predicates))
-	}
-	if q.MinConfidence > 0 {
-		fmt.Fprintf(&sql, "\n  AND f.confidence >= %s", b.arg(q.MinConfidence))
-	}
-
 	limit := q.Limit
 	if limit == 0 {
 		limit = DefaultFactsLimit
 	}
-	// Subject and predicate last in either ordering, so the result is fully
-	// determined: two facts of equal rank come back in the same order every run.
-	if rank != "" {
-		fmt.Fprintf(&sql, "\nORDER BY %s DESC, f.subject, f.predicate, f.object", rank)
-	} else {
-		sql.WriteString("\nORDER BY f.subject, f.predicate, f.object")
+	var text *string
+	if strings.TrimSpace(q.Text) != "" {
+		text = &q.Text
 	}
-	fmt.Fprintf(&sql, "\nLIMIT %s", b.arg(limit))
-
-	facts, err := scanFacts(ctx, s.pool, sql.String(), b.args...)
+	subjects := make([]string, len(q.Subjects))
+	for i, subject := range q.Subjects {
+		subjects[i] = string(subject)
+	}
+	predicates := make([]string, len(q.Predicates))
+	for i, predicate := range q.Predicates {
+		predicates[i] = string(predicate)
+	}
+	facts, err := scanFacts(ctx, s.pool,
+		`SELECT `+factColumns+` FROM mempher.search_facts($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)`,
+		string(q.Scope), string(q.Extractor), q.At, q.AsOf, text, int32(limit),
+		subjects, predicates, q.MinConfidence, q.IncludeClosed)
 	if err != nil {
 		return nil, s.wrapFactError("facts", q.Scope, err)
 	}
@@ -650,18 +377,15 @@ func toValidity(r pgtype.Range[pgtype.Timestamptz]) (mempher.Validity, error) {
 	return out, nil
 }
 
-// qualify prefixes each column in a select list with a table alias.
-func qualify(columns, prefix string) string {
-	parts := strings.Split(columns, ",")
-	for i, part := range parts {
-		parts[i] = prefix + strings.TrimSpace(part)
-	}
-	return strings.Join(parts, ", ")
-}
-
 // wrapFactError turns the conditions L1 has sentinels for into them, and names
 // the scope on everything else.
 func (s *Store) wrapFactError(op string, scope mempher.ScopeID, err error) error {
+	var pgErr *pgconn.PgError
+	if errors.As(err, &pgErr) {
+		if _, ok := apiErrors[pgErr.Code]; ok {
+			return apiError(fmt.Sprintf("%s in scope %q", op, scope), err)
+		}
+	}
 	switch {
 	case isCode(err, pgerrcodeUndefinedTable, pgerrcodeInvalidSchema):
 		return fmt.Errorf("mempher/postgres: %s: run Migrate first: %w", op, ErrSchemaNotReady)

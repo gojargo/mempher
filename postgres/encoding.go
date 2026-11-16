@@ -19,46 +19,19 @@ import (
 // when a query does not say.
 const DefaultPendingEncodingsLimit = 100
 
-// putEncodingSQL takes scope_id and ingested_at from the episode row rather than
-// from the caller. Those two columns are denormalised so the vector channel can
-// filter by scope and as-of without joining, and deriving them here is what
-// guarantees they cannot disagree with L0. %s is the qualified vector type, so
-// the cast does not depend on the pool's search_path.
-//
-// The upsert is what makes an encode job safe to retry, and what makes
-// re-embedding with the same model idempotent.
-const putEncodingSQL = `
-INSERT INTO mempher.episode_encodings
-    (episode_id, model, scope_id, ingested_at, content_vec, surprise, encoded_at)
-SELECT e.id, $2, e.scope_id, e.ingested_at, $3::%s, $4, $5
-FROM mempher.episodes e
-WHERE e.id = $1
-ON CONFLICT (episode_id, model) DO UPDATE
-SET content_vec = excluded.content_vec,
-    surprise    = excluded.surprise,
-    encoded_at  = excluded.encoded_at`
-
 // PutEncoding writes one encoding, replacing any existing one for the same
-// episode and model.
+// episode and model, through mempher.put_encodings, which takes the encoding's
+// scope and ingest time from the episode row rather than from the caller.
 func (s *Store) PutEncoding(ctx context.Context, enc mempher.Encoding) error {
 	if err := s.validateEncoding(enc); err != nil {
 		return err
 	}
-
-	tag, err := s.pool.Exec(ctx, fmt.Sprintf(putEncodingSQL, s.vectorType),
-		uuid.UUID(enc.Episode), string(enc.Model), formatVector(enc.Vector),
-		enc.Surprise, enc.EncodedAt)
-	switch {
-	case isCode(err, pgerrcodeUndefinedTable, pgerrcodeInvalidSchema):
-		return fmt.Errorf("mempher/postgres: put encoding: run Migrate first: %w", ErrSchemaNotReady)
-	case err != nil:
-		return fmt.Errorf("mempher/postgres: put encoding for episode %s: %w", enc.Episode, err)
-	}
-
-	// No episode matched, so the SELECT produced no row to insert.
-	if tag.RowsAffected() == 0 {
-		return fmt.Errorf("mempher/postgres: put encoding: episode %s: %w",
-			enc.Episode, mempher.ErrNotFound)
+	err := s.exec(ctx,
+		fmt.Sprintf(`SELECT mempher.put_encodings($1, $2, $3::%s[], $4, $5)`, s.vectorType),
+		string(enc.Model), []uuid.UUID{uuid.UUID(enc.Episode)},
+		[]string{formatVector(enc.Vector)}, enc.EncodedAt, []float32{enc.Surprise})
+	if err != nil {
+		return apiError(fmt.Sprintf("put encoding for episode %s", enc.Episode), err)
 	}
 	return nil
 }
