@@ -30,6 +30,7 @@ import (
 	"os"
 	"slices"
 	"strings"
+	"unicode/utf8"
 
 	"github.com/gojargo/mempher"
 )
@@ -88,6 +89,18 @@ type Config struct {
 	// [DefaultMaxBatch].
 	MaxBatch int
 
+	// MaxInputBytes cuts every text to at most this many bytes, at a UTF-8
+	// boundary, before it is sent. Zero sends texts whole.
+	//
+	// An embedding model has an input limit, about 8,000 tokens for OpenAI's,
+	// and rejects a longer text together with every other text in its
+	// request. An episode may hold up to [mempher.MaxContentLen] bytes, so a
+	// deployment that stores long messages, such as pasted code, sets this
+	// below the model's limit: the vector then describes the start of a long
+	// episode rather than failing the batch it belongs to. The episode itself
+	// is stored whole either way.
+	MaxInputBytes int
+
 	// HTTPClient issues the request. Nil means [http.DefaultClient].
 	HTTPClient *http.Client
 }
@@ -103,6 +116,7 @@ type Embedder struct {
 	sendDims    bool
 	queryPrefix string
 	maxBatch    int
+	maxInput    int
 }
 
 var _ mempher.Embedder = (*Embedder)(nil)
@@ -119,6 +133,9 @@ func New(cfg Config) (*Embedder, error) {
 	case cfg.MaxBatch < 0:
 		return nil, fmt.Errorf("mempher/embed/openai: new: MaxBatch is %d: %w",
 			cfg.MaxBatch, mempher.ErrInvalidConfig)
+	case cfg.MaxInputBytes < 0:
+		return nil, fmt.Errorf("mempher/embed/openai: new: MaxInputBytes is %d: %w",
+			cfg.MaxInputBytes, mempher.ErrInvalidConfig)
 	}
 	if cfg.MaxBatch == 0 {
 		cfg.MaxBatch = DefaultMaxBatch
@@ -155,6 +172,7 @@ func New(cfg Config) (*Embedder, error) {
 		sendDims:    cfg.RequestDimensions,
 		queryPrefix: cfg.QueryPrefix,
 		maxBatch:    cfg.MaxBatch,
+		maxInput:    cfg.MaxInputBytes,
 	}, nil
 }
 
@@ -213,6 +231,13 @@ type embeddingsResponse struct {
 }
 
 func (e *Embedder) post(ctx context.Context, texts []string) ([]mempher.Vector, error) {
+	if e.maxInput > 0 {
+		cut := make([]string, len(texts))
+		for i, text := range texts {
+			cut[i] = truncate(text, e.maxInput)
+		}
+		texts = cut
+	}
 	request := embeddingsRequest{Model: e.model, Input: texts}
 	if e.sendDims {
 		request.Dimensions = e.dimensions
@@ -287,4 +312,16 @@ func clip(body []byte) string {
 		return string(body[:maxErrorBody]) + "..."
 	}
 	return string(body)
+}
+
+// truncate returns at most limit bytes of text, ending on a rune boundary.
+func truncate(text string, limit int) string {
+	if len(text) <= limit {
+		return text
+	}
+	end := limit
+	for end > 0 && !utf8.RuneStart(text[end]) {
+		end--
+	}
+	return text[:end]
 }

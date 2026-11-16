@@ -96,6 +96,7 @@ func TestNewRejectsUnusableConfig(t *testing.T) {
 		"no width":       {Model: "m"},
 		"negative width": {Model: "m", Dimensions: -1},
 		"negative batch": {Model: "m", Dimensions: 4, MaxBatch: -1},
+		"negative input": {Model: "m", Dimensions: 4, MaxInputBytes: -1},
 	}
 	for name, cfg := range cases {
 		t.Run(name, func(t *testing.T) {
@@ -243,5 +244,24 @@ func TestEmbeddingNothingCostsNoRequest(t *testing.T) {
 	}
 	if len(*seen) != 0 {
 		t.Fatalf("made %d requests for no texts", len(*seen))
+	}
+}
+
+func TestMaxInputBytesCutsLongTextsAtARuneBoundary(t *testing.T) {
+	var inputs []string
+	e, _ := serve(t, Config{MaxInputBytes: 5}, http.StatusOK, func(in []string) string {
+		inputs = append(inputs, in...)
+		return vectors(4)(in)
+	})
+	// "é" is two bytes, so five bytes would split the third one.
+	if _, err := e.EmbedDocuments(t.Context(), []string{"short", "ééé", "abcdefgh"}); err != nil {
+		t.Fatalf("EmbedDocuments: %v", err)
+	}
+	if _, err := e.EmbedQuery(t.Context(), "a long question"); err != nil {
+		t.Fatalf("EmbedQuery: %v", err)
+	}
+	want := []string{"short", "éé", "abcde", "a lon"}
+	if strings.Join(inputs, "|") != strings.Join(want, "|") {
+		t.Errorf("sent %q, want %q", inputs, want)
 	}
 }
