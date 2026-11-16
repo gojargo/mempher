@@ -1,8 +1,8 @@
 -- 0001_init.sql: the whole of mempher's schema, and its SQL API.
 --
 -- The first half is the data: L0 (episodes, immutable and append-only), its
--- vector projection, L1 (facts) with its extraction markers and its own vector
--- projection, and the job queue. The second half is the API: every rule the
+-- vector projection, L1 (facts) with its extraction markers, its own vector
+-- projection and the entities its facts are about, and the job queue. The second half is the API: every rule the
 -- library enforces is a function in the mempher schema, and every client -- the
 -- Go package, a service in another language, psql -- is a caller of the same
 -- functions.
@@ -560,6 +560,99 @@ CREATE TRIGGER facts_truncated
     EXECUTE FUNCTION mempher._drop_fact_encodings();
 
 
+-- ---------------------------------------------------------------------------
+-- L1: entities. What facts are about, and every name each goes by.
+-- ---------------------------------------------------------------------------
+
+-- A triple is identity only while its subject is spelled one way. "Anna" in one
+-- episode and "the user's sister" in the next are two subjects to the temporal
+-- key above, so nothing dedupes, nothing supersedes, and a question about one
+-- misses what is known under the other. An entity is the thing behind the
+-- names, and mempher.entity_aliases is every name it has been given.
+--
+-- The rule the rest of L1 leans on: mempher.facts.subject is always the name of
+-- an entity, never one of its other aliases. apply_extraction rewrites a
+-- subject to that name before it writes, and merging two entities rewrites the
+-- facts of the one that goes. So the temporal key, the subject filters and the
+-- known facts shown to an extractor all see one spelling per thing, and no
+-- reader has to resolve a name to get a consistent answer.
+--
+-- Objects are left as written. "the user's sister, name, Anna" must keep its
+-- object, so an object is linked to an entity only when it is read: whenever
+-- its text is one of an entity's names, the fact is an edge between its subject
+-- and that entity, which is what mempher.related_facts walks.
+--
+-- Entities are keyed by extractor, as facts are: two extractors' opinions of
+-- who is who must not merge either. They are not removed when mempher.facts is
+-- truncated, because an alias may have been declared by hand and no replay
+-- would bring it back; truncate mempher.entities CASCADE alongside to rebuild
+-- the names as well.
+
+-- The form in which two spellings of a name are the same name: case and runs
+-- of whitespace do not distinguish them. Nothing cleverer happens here. Deciding
+-- that "Anna" and "Anna Martin" are one person is a judgement, and judgements
+-- are declared, by an extractor or an operator, not guessed by a function.
+CREATE FUNCTION mempher._entity_key(p_name text)
+    RETURNS text
+    LANGUAGE sql
+    IMMUTABLE
+    PARALLEL SAFE
+    SET search_path FROM CURRENT
+RETURN lower(btrim(regexp_replace(p_name, '\s+', ' ', 'g')));
+
+CREATE TABLE mempher.entities (
+    -- The handle a client holds. It survives the entity gaining names, and is
+    -- gone once the entity has been merged into another.
+    id          uuid        NOT NULL DEFAULT uuidv7(),
+    scope_id    text        NOT NULL,
+    extractor   text        NOT NULL,
+
+    -- The spelling its facts carry as their subject: the first one written.
+    name        text        NOT NULL,
+
+    created_at  timestamptz NOT NULL,
+    updated_at  timestamptz NOT NULL,
+
+    CONSTRAINT entities_pkey          PRIMARY KEY (id),
+    CONSTRAINT entities_scope_fkey    FOREIGN KEY (scope_id) REFERENCES mempher.scopes (id),
+    CONSTRAINT entities_extractor_len CHECK (length(extractor) BETWEEN 1 AND 200),
+    CONSTRAINT entities_name_len      CHECK (length(name) BETWEEN 1 AND 200)
+);
+
+-- Lists a scope's entities by name.
+CREATE INDEX entities_scope_idx
+    ON mempher.entities (scope_id, extractor, name);
+
+-- One row per name, the entity's own included. The primary key is the
+-- resolution: within a scope and an extractor a name leads to exactly one
+-- entity, so merging two entities is moving rows here, and there is no chain of
+-- redirections for a reader to follow.
+CREATE TABLE mempher.entity_aliases (
+    scope_id    text        NOT NULL,
+    extractor   text        NOT NULL,
+    key         text        NOT NULL,
+    -- The name as it was first written, which is what a reader is shown.
+    alias       text        NOT NULL,
+    entity_id   uuid        NOT NULL,
+
+    -- The episodes of the extraction that introduced the name, so that erasing
+    -- them takes the name with them. Empty for a name an operator declared.
+    episode_ids uuid[]      NOT NULL DEFAULT '{}',
+
+    created_at  timestamptz NOT NULL,
+
+    CONSTRAINT entity_aliases_pkey        PRIMARY KEY (scope_id, extractor, key),
+    CONSTRAINT entity_aliases_entity_fkey FOREIGN KEY (entity_id)
+        REFERENCES mempher.entities (id) ON DELETE CASCADE,
+    CONSTRAINT entity_aliases_key         CHECK (key <> '' AND key = mempher._entity_key(alias)),
+    CONSTRAINT entity_aliases_alias_len   CHECK (length(alias) BETWEEN 1 AND 200)
+);
+
+-- Every name of one entity: listing them, and moving them in a merge.
+CREATE INDEX entity_aliases_entity_idx
+    ON mempher.entity_aliases (entity_id);
+
+
 -- ===========================================================================
 -- The SQL API
 -- ===========================================================================
@@ -599,7 +692,7 @@ CREATE TRIGGER facts_truncated
 --     MP007 invalid channel             MP023 job not leased by this worker
 --     MP008 invalid job kind            MP024 job is not dead
 --     MP009 invalid job state           MP025 the same work is already queued
---     MP010 invalid fact
+--     MP010 invalid fact                MP014 invalid entity name
 
 -- ---------------------------------------------------------------------------
 -- Internal helpers
@@ -1420,6 +1513,170 @@ COMMENT ON FUNCTION mempher.put_encodings(text, uuid[], vector[], timestamptz, r
     'for that model, and returns how many were written. The arrays are parallel. An '
     'episode that does not exist fails the whole call with MP020.';
 
+-- Entities. Everything that writes L1 for a scope goes through these, under
+-- _lock_l1, so a name is never resolved against aliases that another
+-- transaction is in the middle of moving.
+
+-- Serialises the writers of one scope's L1 until the transaction ends. An
+-- extraction rewrites subjects to the names the aliases give, and a merge
+-- rewrites the facts and the aliases together; two of them interleaved would
+-- leave a fact under a name whose entity has just gone. The work it serialises
+-- is the few milliseconds of applying an extraction, never the model call
+-- before it.
+CREATE FUNCTION mempher._lock_l1(p_scope text)
+    RETURNS void
+    LANGUAGE sql
+    SET search_path FROM CURRENT
+AS $$
+    SELECT pg_advisory_xact_lock(hashtextextended('mempher.l1:' || p_scope, 0))
+$$;
+
+-- A name an entity can go by: a label of 1 to 200 bytes that is not blank.
+CREATE FUNCTION mempher._check_entity_name(p_value text, p_what text, p_code text DEFAULT 'MP014')
+    RETURNS void
+    LANGUAGE plpgsql
+    IMMUTABLE
+    SET search_path FROM CURRENT
+AS $$
+BEGIN
+    PERFORM mempher._check_label(p_value, p_what, p_code, 200);
+    IF mempher._entity_key(p_value) = '' THEN
+        PERFORM mempher._fail(p_code, format('%s is blank', p_what));
+    END IF;
+END $$;
+
+-- The entity a name leads to, created under that name when nothing goes by it
+-- yet. The caller holds _lock_l1.
+CREATE FUNCTION mempher._entity(
+    p_scope text, p_extractor text, p_name text, p_at timestamptz, p_episodes uuid[])
+    RETURNS uuid
+    LANGUAGE plpgsql
+    SET search_path FROM CURRENT
+AS $$
+DECLARE
+    v_key text := mempher._entity_key(p_name);
+    v_id  uuid;
+BEGIN
+    SELECT a.entity_id INTO v_id FROM mempher.entity_aliases a
+    WHERE a.scope_id = p_scope AND a.extractor = p_extractor AND a.key = v_key;
+    IF FOUND THEN
+        RETURN v_id;
+    END IF;
+    INSERT INTO mempher.entities (scope_id, extractor, name, created_at, updated_at)
+    VALUES (p_scope, p_extractor, p_name, p_at, p_at)
+    RETURNING id INTO v_id;
+    INSERT INTO mempher.entity_aliases (scope_id, extractor, key, alias, entity_id, episode_ids, created_at)
+    VALUES (p_scope, p_extractor, v_key, p_name, v_id, coalesce(p_episodes, '{}'), p_at);
+    RETURN v_id;
+END $$;
+
+-- Records that p_alias is another name for whatever p_of names, and returns the
+-- entity both now lead to. The caller holds _lock_l1.
+--
+-- A name nothing goes by yet is simply added. A name that already leads to a
+-- different entity means the two were one thing all along, and that entity is
+-- merged into p_of's: its names move, its facts are rewritten to the surviving
+-- subject, and its row goes.
+--
+-- Rewriting can put two rows on one claim over overlapping windows, which the
+-- temporal key forbids and which is exactly the duplicate the merge exists to
+-- remove. The surviving entity's row stands as it is and gains the other's
+-- episodes as provenance; the other row is deleted. Which of two windows was
+-- right is not something a merge can know, so it does not combine them: the
+-- side named as the real one is believed.
+CREATE FUNCTION mempher._alias_entity(
+    p_scope text, p_extractor text, p_alias text, p_of text, p_at timestamptz, p_episodes uuid[])
+    RETURNS uuid
+    LANGUAGE plpgsql
+    SET search_path FROM CURRENT
+AS $$
+DECLARE
+    v_key       text := mempher._entity_key(p_alias);
+    v_into      uuid := mempher._entity(p_scope, p_extractor, p_of, p_at, p_episodes);
+    v_from      uuid;
+    v_into_name text;
+    v_from_name text;
+BEGIN
+    SELECT a.entity_id INTO v_from FROM mempher.entity_aliases a
+    WHERE a.scope_id = p_scope AND a.extractor = p_extractor AND a.key = v_key;
+    IF NOT FOUND THEN
+        INSERT INTO mempher.entity_aliases (scope_id, extractor, key, alias, entity_id, episode_ids, created_at)
+        VALUES (p_scope, p_extractor, v_key, p_alias, v_into, coalesce(p_episodes, '{}'), p_at);
+        UPDATE mempher.entities SET updated_at = p_at WHERE id = v_into;
+        RETURN v_into;
+    ELSIF v_from = v_into THEN
+        RETURN v_into;
+    END IF;
+
+    SELECT e.name INTO v_into_name FROM mempher.entities e WHERE e.id = v_into;
+    SELECT e.name INTO v_from_name FROM mempher.entities e WHERE e.id = v_from;
+
+    WITH clash AS (
+        SELECT kept.id AS kept, gone.id AS gone, gone.episode_ids
+        FROM mempher.facts kept
+        JOIN mempher.facts gone
+          ON gone.scope_id = kept.scope_id AND gone.extractor = kept.extractor
+         AND gone.predicate = kept.predicate AND gone.object = kept.object
+         AND gone.valid && kept.valid
+        WHERE kept.scope_id = p_scope AND kept.extractor = p_extractor
+          AND kept.subject = v_into_name AND gone.subject = v_from_name
+    ), gained AS (
+        SELECT c.kept, array_agg(e) AS episode_ids
+        FROM clash c, unnest(c.episode_ids) AS e
+        GROUP BY c.kept
+    ), credited AS (
+        UPDATE mempher.facts f
+        SET episode_ids = (SELECT array_agg(DISTINCT e ORDER BY e)
+                           FROM unnest(f.episode_ids || g.episode_ids) AS e),
+            updated_at  = p_at
+        FROM gained g
+        WHERE f.id = g.kept
+    )
+    DELETE FROM mempher.facts f USING clash c WHERE f.id = c.gone;
+
+    UPDATE mempher.facts f
+    SET subject = v_into_name, updated_at = p_at
+    WHERE f.scope_id = p_scope AND f.extractor = p_extractor AND f.subject = v_from_name;
+
+    UPDATE mempher.entity_aliases SET entity_id = v_into WHERE entity_id = v_from;
+    DELETE FROM mempher.entities WHERE id = v_from;
+    UPDATE mempher.entities SET updated_at = p_at WHERE id = v_into;
+    RETURN v_into;
+END $$;
+
+CREATE FUNCTION mempher.merge_entities(
+    p_scope     text,
+    p_extractor text,
+    p_alias     text,
+    p_into      text,
+    p_at        timestamptz DEFAULT now()
+)
+    RETURNS uuid
+    LANGUAGE plpgsql
+    SET search_path FROM CURRENT
+AS $$
+BEGIN
+    PERFORM mempher._check_scope(p_scope);
+    PERFORM mempher._check_label(p_extractor, 'extractor', 'MP013', 200);
+    PERFORM mempher._check_entity_name(p_alias, 'alias');
+    PERFORM mempher._check_entity_name(p_into, 'into');
+    PERFORM mempher._check_at(p_at);
+    IF NOT EXISTS (SELECT 1 FROM mempher.scopes s WHERE s.id = p_scope) THEN
+        PERFORM mempher._fail('MP020', format('no such scope %L', p_scope));
+    END IF;
+    PERFORM mempher._lock_l1(p_scope);
+    RETURN mempher._alias_entity(p_scope, p_extractor, p_alias, p_into, p_at, NULL);
+END $$;
+
+COMMENT ON FUNCTION mempher.merge_entities(text, text, text, text, timestamptz) IS
+    'Declares that p_alias and p_into name the same thing in one extractor''s view of a '
+    'scope, and returns the id of the entity both now lead to. A name nothing goes by '
+    'yet is added; if p_alias already names another entity, that entity is merged into '
+    'p_into''s: its names move and its facts take the surviving subject, and where both '
+    'held the same claim over overlapping windows the surviving entity''s fact stands. '
+    'Declaring it twice changes nothing the second time. There is no unmerge: a wrong '
+    'merge is repaired by rebuilding L1 from L0.';
+
 -- Applying an extraction.
 
 CREATE FUNCTION mempher.apply_extraction(
@@ -1429,7 +1686,8 @@ CREATE FUNCTION mempher.apply_extraction(
     p_assert    jsonb       DEFAULT '[]',
     p_retract   jsonb       DEFAULT '[]',
     p_at        timestamptz DEFAULT now(),
-    p_encode    boolean     DEFAULT true
+    p_encode    boolean     DEFAULT true,
+    p_aliases   jsonb       DEFAULT '[]'
 )
     RETURNS SETOF mempher.facts
     LANGUAGE plpgsql
@@ -1448,6 +1706,7 @@ DECLARE
     v_lower    timestamptz;
     v_clash    record;
     v_unknown  text;
+    v_name     text;
 BEGIN
     PERFORM mempher._check_scope(p_scope);
     PERFORM mempher._check_label(p_extractor, 'extractor', 'MP012', 200);
@@ -1466,6 +1725,12 @@ BEGIN
     ELSIF jsonb_array_length(p_retract) > 64 THEN
         PERFORM mempher._fail('MP012', format('extraction retracts %s facts, limit is 64',
             jsonb_array_length(p_retract)));
+    END IF;
+    IF jsonb_typeof(p_aliases) IS DISTINCT FROM 'array' THEN
+        PERFORM mempher._fail('MP012', 'aliases is not a JSON array');
+    ELSIF jsonb_array_length(p_aliases) > 64 THEN
+        PERFORM mempher._fail('MP012', format('extraction declares %s aliases, limit is 64',
+            jsonb_array_length(p_aliases)));
     END IF;
 
     -- Every assertion is checked before anything is written.
@@ -1489,7 +1754,7 @@ BEGIN
             PERFORM mempher._fail('MP010', format(
                 '%s: subject, predicate, object and statement must all be strings', v_where));
         END IF;
-        PERFORM mempher._check_label(v_elem->>'subject', v_where || ': subject', 'MP010', 200);
+        PERFORM mempher._check_entity_name(v_elem->>'subject', v_where || ': subject', 'MP010');
         PERFORM mempher._check_label(v_elem->>'predicate', v_where || ': predicate', 'MP010', 100, true);
         IF v_elem->>'object' = '' OR octet_length(v_elem->>'object') > 1000 THEN
             PERFORM mempher._fail('MP010', format('%s: object must be 1 to 1000 bytes', v_where));
@@ -1512,10 +1777,13 @@ BEGIN
     -- The same claim twice over the same window is one claim, and the first
     -- wording of it wins. Over two windows that overlap it is a contradiction
     -- the model made within one answer, which the database would reject anyway,
-    -- less legibly.
+    -- less legibly. Two spellings of a subject that differ only in case or
+    -- spacing are one subject here; two that an alias joins are caught by the
+    -- temporal key below.
     SELECT a.subject, a.predicate, a.object INTO v_clash
     FROM mempher._assertions(p_assert) a JOIN mempher._assertions(p_assert) b
-      ON a.ord < b.ord AND (a.subject, a.predicate, a.object) = (b.subject, b.predicate, b.object)
+      ON a.ord < b.ord AND mempher._entity_key(a.subject) = mempher._entity_key(b.subject)
+     AND (a.predicate, a.object) = (b.predicate, b.object)
      AND a.valid && b.valid AND a.valid <> b.valid
     LIMIT 1;
     IF FOUND THEN
@@ -1534,6 +1802,23 @@ BEGIN
         END IF;
         PERFORM mempher._json_time(v_elem, 'at', v_where, 'MP012', true);
     END LOOP;
+
+    FOR v_elem, v_ord IN SELECT e, o FROM jsonb_array_elements(p_aliases) WITH ORDINALITY AS a(e, o)
+    LOOP
+        v_where := format('alias %s', v_ord);
+        IF jsonb_typeof(v_elem) <> 'object'
+           OR EXISTS (SELECT 1 FROM jsonb_object_keys(v_elem) AS k WHERE k NOT IN ('alias', 'of'))
+           OR jsonb_typeof(v_elem->'alias') IS DISTINCT FROM 'string'
+           OR jsonb_typeof(v_elem->'of') IS DISTINCT FROM 'string' THEN
+            PERFORM mempher._fail('MP012', format('%s must be {"alias": name, "of": name}', v_where));
+        END IF;
+        PERFORM mempher._check_entity_name(v_elem->>'alias', v_where || ': alias');
+        PERFORM mempher._check_entity_name(v_elem->>'of', v_where || ': of');
+    END LOOP;
+
+    -- From here on the scope's names are read and written, so its other L1
+    -- writers wait.
+    PERFORM mempher._lock_l1(p_scope);
 
     -- The markers say which episodes this extractor has read. They are what
     -- makes a retried job a no-op rather than a second application: if every
@@ -1587,16 +1872,44 @@ BEGIN
             END IF;
         END LOOP;
 
+        -- Names next, in the order given, so that a later alias can build on
+        -- an earlier one. They come after the retractions, which name facts
+        -- by ids a merge may remove, and before the assertions, which are
+        -- written under whatever name these leave standing.
+        FOR v_elem IN SELECT e FROM jsonb_array_elements(p_aliases) AS a(e)
+        LOOP
+            PERFORM mempher._alias_entity(p_scope, p_extractor,
+                v_elem->>'alias', v_elem->>'of', p_at, p_episodes);
+        END LOOP;
+
+        -- Every subject is an entity, created under the first spelling it is
+        -- given.
+        FOR v_name IN
+            SELECT DISTINCT ON (mempher._entity_key(x.subject)) x.subject
+            FROM mempher._assertions(p_assert) x
+            ORDER BY mempher._entity_key(x.subject), x.ord
+        LOOP
+            PERFORM mempher._entity(p_scope, p_extractor, v_name, p_at, p_episodes);
+        END LOOP;
+
         -- A claim already held over exactly this window gains this
         -- extraction's episodes as provenance and its latest wording; any
         -- other claim is a new row. A new row that overlaps a window the
         -- scope already believes is the conflict WITHOUT OVERLAPS exists to
-        -- catch.
+        -- catch. Each is written under its entity's name, whichever of the
+        -- entity's names the assertion used, which is what makes the same
+        -- claim about "Anna" and about "the user's sister" one row.
         BEGIN
             WITH a AS (
-                SELECT DISTINCT ON (x.subject, x.predicate, x.object, x.valid) x.*
+                SELECT DISTINCT ON (n.name, x.predicate, x.object, x.valid)
+                       x.ord, n.name AS subject, x.predicate, x.object,
+                       x.statement, x.valid, x.confidence
                 FROM mempher._assertions(p_assert) x
-                ORDER BY x.subject, x.predicate, x.object, x.valid, x.ord
+                JOIN mempher.entity_aliases al
+                  ON al.scope_id = p_scope AND al.extractor = p_extractor
+                 AND al.key = mempher._entity_key(x.subject)
+                JOIN mempher.entities n ON n.id = al.entity_id
+                ORDER BY n.name, x.predicate, x.object, x.valid, x.ord
             ), updated AS (
                 UPDATE mempher.facts f
                 SET statement   = a.statement,
@@ -1646,11 +1959,14 @@ BEGIN
     ORDER BY subject, predicate, object, lower(valid);
 END $$;
 
-COMMENT ON FUNCTION mempher.apply_extraction(text, text, uuid[], jsonb, jsonb, timestamptz, boolean) IS
+COMMENT ON FUNCTION mempher.apply_extraction(text, text, uuid[], jsonb, jsonb, timestamptz, boolean, jsonb) IS
     'Records one extraction of some episodes atomically: their read markers, the '
-    'retractions (each {"fact": uuid, "at": timestamp} closes that fact''s window), and the '
-    'assertions (each {"subject", "predicate", "object", "statement", "valid_from", '
-    '"valid_to"?, "confidence"?}). Applying the same extraction twice changes nothing the '
+    'retractions (each {"fact": uuid, "at": timestamp} closes that fact''s window), the '
+    'aliases (each {"alias": name, "of": name} declares two names for one entity, as '
+    'merge_entities does), and the assertions (each {"subject", "predicate", "object", '
+    '"statement", "valid_from", "valid_to"?, "confidence"?}). Every subject becomes an '
+    'entity, and a fact is stored under its entity''s name whichever of its names the '
+    'assertion used. Applying the same extraction twice changes nothing the '
     'second time. Returns every fact the extraction''s episodes support, and, unless '
     'p_encode is false, queues an encode_facts job when one of them has no vector.';
 
@@ -1821,7 +2137,8 @@ COMMENT ON FUNCTION mempher.enqueue_fact_encodings(text, text, timestamptz, time
 -- The weights a fusion runs with: the caller's, checked, with the lexical
 -- channel at a quarter of a vote unless they say otherwise. That default was
 -- calibrated on LongMemEval for episodes, where an equal vote let keyword
--- overlap outrank meaning; facts use it unmeasured.
+-- overlap outrank meaning; facts use it unmeasured. "entity" weighs the vote a
+-- fact gets for touching an entity the question names, and is unmeasured too.
 CREATE FUNCTION mempher._fusion_weights(p_weights jsonb)
     RETURNS jsonb
     LANGUAGE plpgsql
@@ -1836,7 +2153,7 @@ BEGIN
         PERFORM mempher._fail('MP013', 'weights is not a JSON object');
     END IF;
     SELECT key INTO v_bad FROM jsonb_each(v_weights)
-    WHERE key NOT IN ('semantic', 'lexical', 'fact')
+    WHERE key NOT IN ('semantic', 'lexical', 'fact', 'entity')
        OR jsonb_typeof(value) <> 'number' OR value::float8 < 0
     LIMIT 1;
     IF FOUND THEN
@@ -1878,6 +2195,41 @@ BEGIN
     END IF;
 END $$;
 
+-- A text as the words in it, lowercased and single-spaced with a space at each
+-- end, so that one text names another's subject exactly when it contains it:
+-- " anna " is in " where does anna live " and not in " where does hanna live ".
+CREATE FUNCTION mempher._mention_key(p_text text)
+    RETURNS text
+    LANGUAGE sql
+    IMMUTABLE
+    PARALLEL SAFE
+    SET search_path FROM CURRENT
+RETURN ' ' || btrim(regexp_replace(lower(coalesce(p_text, '')), '[^[:alnum:]]+', ' ', 'g')) || ' ';
+
+-- The entities a text names, by any of the names each went by at p_as_of.
+-- Every alias of the scope is tried against the text, which is a scan of one
+-- scope's names and nothing wider.
+CREATE FUNCTION mempher._mentioned_entities(
+    p_scope text, p_extractor text, p_text text, p_as_of timestamptz)
+    RETURNS uuid[]
+    LANGUAGE plpgsql
+    STABLE
+    SET search_path FROM CURRENT
+AS $$
+DECLARE
+    v_text text := mempher._mention_key(p_text);
+BEGIN
+    IF v_text = '  ' THEN
+        RETURN '{}';
+    END IF;
+    RETURN coalesce((
+        SELECT array_agg(DISTINCT a.entity_id)
+        FROM mempher.entity_aliases a
+        WHERE a.scope_id = p_scope AND a.extractor = p_extractor AND a.created_at <= p_as_of
+          AND mempher._mention_key(a.alias) <> '  '
+          AND strpos(v_text, mempher._mention_key(a.alias)) > 0), '{}');
+END $$;
+
 CREATE FUNCTION mempher.search_facts(
     p_scope          text,
     p_extractor      text,
@@ -1900,8 +2252,10 @@ CREATE FUNCTION mempher.search_facts(
     SET search_path FROM CURRENT
 AS $$
 DECLARE
-    v_query   tsquery;
-    v_weights jsonb;
+    v_query     tsquery;
+    v_weights   jsonb;
+    v_subjects  text[];
+    v_mentioned uuid[];
 BEGIN
     PERFORM mempher._check_scope(p_scope);
     PERFORM mempher._check_label(p_extractor, 'extractor', 'MP013', 200);
@@ -1923,28 +2277,50 @@ BEGIN
     v_weights := mempher._fusion_weights(p_weights);
     v_query := mempher._any_lexeme_query(p_text);
 
+    -- A subject filter may use any name the entity goes by; the facts
+    -- themselves carry one. A name nothing goes by is kept as given, and
+    -- matches nothing.
+    IF cardinality(p_subjects) > 0 THEN
+        SELECT array_agg(coalesce(e.name, s)) INTO v_subjects
+        FROM unnest(p_subjects) AS s
+        LEFT JOIN mempher.entity_aliases a
+               ON a.scope_id = p_scope AND a.extractor = p_extractor
+              AND a.key = mempher._entity_key(s)
+        LEFT JOIN mempher.entities e ON e.id = a.entity_id;
+    END IF;
+    v_mentioned := mempher._mentioned_entities(p_scope, p_extractor, p_text, p_as_of);
+
     -- The question ranks, it never filters: relevance decides which facts
     -- survive the limit, not which are true. A fact the question does not
     -- mention is still a fact about the scope.
     --
-    -- Two rankings vote, by reciprocal rank as recall fuses episodes: nearness
-    -- of the statement's vector to p_embedding, and the words the statement
-    -- shares with p_text. A fact with no vector yet, or sharing no word, has no
-    -- vote from that ranking. With no embedding the order is the lexical one.
-    -- Subject, predicate and object close the ordering, so equal scores come
-    -- back in the same order every run.
+    -- Three rankings vote, by reciprocal rank as recall fuses episodes: nearness
+    -- of the statement's vector to p_embedding, the words the statement shares
+    -- with p_text, and whether the fact touches an entity p_text names, as its
+    -- subject or as its object. The last is what finds "the user's sister lives
+    -- in Paris" for a question about Anna: the name is in neither the statement
+    -- nor, necessarily, anywhere near it in meaning. Every fact that touches a
+    -- named entity ties for first in that ranking. A fact with no vector yet,
+    -- sharing no word, or touching no named entity has no vote from that
+    -- ranking. Subject, predicate and object close the ordering, so equal
+    -- scores come back in the same order every run.
     RETURN QUERY
     WITH candidates AS (
         SELECT f AS fact,
                ts_rank_cd(f.statement_tsv, v_query) AS lexical,
-               x.statement_vec <=> p_embedding AS distance
+               x.statement_vec <=> p_embedding AS distance,
+               cardinality(v_mentioned) > 0 AND EXISTS (
+                   SELECT 1 FROM mempher.entity_aliases a
+                   WHERE a.scope_id = p_scope AND a.extractor = p_extractor
+                     AND a.key IN (mempher._entity_key(f.subject), mempher._entity_key(f.object))
+                     AND a.entity_id = ANY(v_mentioned)) AS named
         FROM mempher.facts f
         LEFT JOIN mempher.fact_encodings x
                ON p_embedding IS NOT NULL AND x.fact_id = f.id AND x.model = p_model
         WHERE f.scope_id = p_scope AND f.extractor = p_extractor
           AND f.asserted_at <= p_as_of
           AND CASE WHEN p_include_closed THEN lower(f.valid) <= p_at ELSE f.valid @> p_at END
-          AND (p_subjects IS NULL OR cardinality(p_subjects) = 0 OR f.subject = ANY(p_subjects))
+          AND (v_subjects IS NULL OR f.subject = ANY(v_subjects))
           AND (p_predicates IS NULL OR cardinality(p_predicates) = 0 OR f.predicate = ANY(p_predicates))
           AND f.confidence >= p_min_confidence
     ), scored AS (
@@ -1956,6 +2332,9 @@ BEGIN
              + CASE WHEN c.lexical > 0
                     THEN (v_weights->>'lexical')::float8
                          / (p_fusion_k + rank() OVER (ORDER BY c.lexical DESC))
+                    ELSE 0 END
+             + CASE WHEN c.named
+                    THEN coalesce((v_weights->>'entity')::float8, 1) / (p_fusion_k + 1)
                     ELSE 0 END AS score
         FROM candidates c
     )
@@ -1969,10 +2348,160 @@ COMMENT ON FUNCTION mempher.search_facts(text, text, timestamptz, timestamptz, t
                                          real, boolean, vector, text, jsonb, float8) IS
     'Returns the facts one extractor holds about a scope that are true at p_at, as known '
     'by p_as_of. With p_include_closed, also those that began by p_at and have since '
-    'stopped being true. The question orders them and never excludes one: by meaning '
-    'when p_embedding is given (the question embedded by p_model), by shared words when '
-    'p_text is, and by both fused by reciprocal rank, weighted by p_weights (lexical '
-    'defaults to 0.25).';
+    'stopped being true. p_subjects may use any name an entity goes by. The question '
+    'orders the facts and never excludes one: by meaning when p_embedding is given (the '
+    'question embedded by p_model), by shared words and by the entities it names when '
+    'p_text is, all fused by reciprocal rank, weighted by p_weights (lexical defaults to '
+    '0.25, entity to 1).';
+
+CREATE FUNCTION mempher.list_entities(
+    p_scope        text,
+    p_extractor    text,
+    p_mentioned_in text        DEFAULT NULL,
+    p_as_of        timestamptz DEFAULT now(),
+    p_limit        int         DEFAULT 200
+)
+    RETURNS TABLE (id uuid, name text, aliases text[], facts bigint,
+                   created_at timestamptz, updated_at timestamptz)
+    LANGUAGE plpgsql
+    STABLE
+    SET search_path FROM CURRENT
+AS $$
+#variable_conflict use_column
+DECLARE
+    v_mentioned uuid[];
+BEGIN
+    PERFORM mempher._check_scope(p_scope);
+    PERFORM mempher._check_label(p_extractor, 'extractor', 'MP013', 200);
+    PERFORM mempher._check_at(p_as_of, 'as_of');
+    IF p_limit IS NULL OR p_limit < 1 THEN
+        PERFORM mempher._fail('MP013', format('limit is %s, must be positive', p_limit));
+    END IF;
+    IF octet_length(p_mentioned_in) > 1048576 THEN
+        PERFORM mempher._fail('MP002', 'mentioned_in is longer than 1048576 bytes');
+    END IF;
+    IF p_mentioned_in IS NOT NULL THEN
+        v_mentioned := mempher._mentioned_entities(p_scope, p_extractor, p_mentioned_in, p_as_of);
+    END IF;
+
+    RETURN QUERY
+    SELECT e.id, e.name,
+           coalesce((SELECT array_agg(a.alias ORDER BY a.alias)
+                     FROM mempher.entity_aliases a
+                     WHERE a.entity_id = e.id AND a.created_at <= p_as_of
+                       AND a.key <> mempher._entity_key(e.name)), '{}'),
+           (SELECT count(*) FROM mempher.facts f
+            WHERE f.scope_id = e.scope_id AND f.extractor = e.extractor
+              AND f.subject = e.name AND f.asserted_at <= p_as_of),
+           e.created_at, e.updated_at
+    FROM mempher.entities e
+    WHERE e.scope_id = p_scope AND e.extractor = p_extractor AND e.created_at <= p_as_of
+      AND (v_mentioned IS NULL OR e.id = ANY(v_mentioned))
+    ORDER BY e.name, e.id
+    LIMIT p_limit;
+END $$;
+
+COMMENT ON FUNCTION mempher.list_entities(text, text, text, timestamptz, int) IS
+    'Lists the entities one extractor knows in a scope as of p_as_of, by name: each with '
+    'its other names and how many facts are about it. With p_mentioned_in, only the '
+    'entities that text names, by any name, as whole words and whatever the case.';
+
+-- The facts around some entities. A fact whose object is one of an entity's
+-- names is an edge between its subject and that entity, in both directions, so
+-- the facts of a scope are a graph and "what do we know around Anna" is a walk
+-- of it: Anna, then whoever a fact ties to Anna, then whoever a fact ties to
+-- them. The walk stops at p_hops, which is also what ends it on a cycle.
+CREATE FUNCTION mempher.related_facts(
+    p_scope     text,
+    p_extractor text,
+    p_entities  text[],
+    p_hops      int         DEFAULT 1,
+    p_at        timestamptz DEFAULT now(),
+    p_as_of     timestamptz DEFAULT now(),
+    p_limit     int         DEFAULT 200
+)
+    RETURNS TABLE (hops int, id uuid, scope_id text, extractor text, subject text,
+                   predicate text, object text, statement text, valid tstzrange,
+                   confidence real, episode_ids uuid[], asserted_at timestamptz,
+                   updated_at timestamptz)
+    LANGUAGE plpgsql
+    STABLE
+    SET search_path FROM CURRENT
+AS $$
+#variable_conflict use_column
+DECLARE
+    v_name text;
+BEGIN
+    PERFORM mempher._check_scope(p_scope);
+    PERFORM mempher._check_label(p_extractor, 'extractor', 'MP013', 200);
+    PERFORM mempher._check_at(p_at);
+    PERFORM mempher._check_at(p_as_of, 'as_of');
+    IF p_entities IS NULL OR cardinality(p_entities) = 0 THEN
+        PERFORM mempher._fail('MP013', 'related_facts needs at least one entity to start from');
+    ELSIF cardinality(p_entities) > 64 THEN
+        PERFORM mempher._fail('MP013', format('related_facts starts from %s entities, limit is 64',
+            cardinality(p_entities)));
+    END IF;
+    FOREACH v_name IN ARRAY p_entities LOOP
+        PERFORM mempher._check_entity_name(v_name, 'entity');
+    END LOOP;
+    IF p_hops IS NULL OR p_hops < 0 OR p_hops > 8 THEN
+        PERFORM mempher._fail('MP013', format('hops is %s, must be 0 to 8', p_hops));
+    END IF;
+    IF p_limit IS NULL OR p_limit < 1 THEN
+        PERFORM mempher._fail('MP013', format('limit is %s, must be positive', p_limit));
+    END IF;
+
+    RETURN QUERY
+    WITH RECURSIVE visible AS MATERIALIZED (
+        -- Every fact true at p_at, with the entity it is about and the entity
+        -- its object names, if it names one.
+        SELECT f.id AS fact_id, s.entity_id AS subject_entity, o.entity_id AS object_entity
+        FROM mempher.facts f
+        LEFT JOIN mempher.entity_aliases s
+               ON s.scope_id = f.scope_id AND s.extractor = f.extractor
+              AND s.key = mempher._entity_key(f.subject)
+        LEFT JOIN mempher.entity_aliases o
+               ON o.scope_id = f.scope_id AND o.extractor = f.extractor
+              AND o.key = mempher._entity_key(f.object)
+        WHERE f.scope_id = p_scope AND f.extractor = p_extractor
+          AND f.asserted_at <= p_as_of AND f.valid @> p_at
+    ), reach (entity_id, hops) AS (
+        SELECT a.entity_id, 0
+        FROM mempher.entity_aliases a
+        WHERE a.scope_id = p_scope AND a.extractor = p_extractor
+          AND a.key IN (SELECT mempher._entity_key(n) FROM unnest(p_entities) AS n)
+      UNION
+        SELECT CASE WHEN v.subject_entity = r.entity_id THEN v.object_entity
+                    ELSE v.subject_entity END,
+               r.hops + 1
+        FROM reach r
+        JOIN visible v ON r.entity_id IN (v.subject_entity, v.object_entity)
+        WHERE r.hops < p_hops AND v.subject_entity <> v.object_entity
+    ), nearest AS (
+        SELECT r.entity_id, min(r.hops) AS hops FROM reach r GROUP BY r.entity_id
+    ), touched AS (
+        -- A fact is as near as the nearer of the two entities it ties.
+        SELECT v.fact_id, min(n.hops) AS hops
+        FROM visible v
+        JOIN nearest n ON n.entity_id IN (v.subject_entity, v.object_entity)
+        GROUP BY v.fact_id
+    )
+    SELECT t.hops, f.id, f.scope_id, f.extractor, f.subject, f.predicate, f.object,
+           f.statement, f.valid, f.confidence, f.episode_ids, f.asserted_at, f.updated_at
+    FROM touched t
+    JOIN mempher.facts f ON f.id = t.fact_id
+    ORDER BY t.hops, f.subject, f.predicate, f.object, lower(f.valid)
+    LIMIT p_limit;
+END $$;
+
+COMMENT ON FUNCTION mempher.related_facts(text, text, text[], int, timestamptz, timestamptz, int) IS
+    'Returns the facts true at p_at, as known by p_as_of, that lie within p_hops of the '
+    'entities named in p_entities (by any of their names), nearest first. A fact whose '
+    'object is the name of an entity ties its subject to that entity; hops 0 is every '
+    'fact that touches a named entity as subject or object, and each further hop adds '
+    'the facts of the entities those tie it to. A name nothing goes by contributes '
+    'nothing.';
 
 -- mempher.recall runs every retrieval channel the caller asked for, fuses the
 -- episode channels by reciprocal rank, reads what the scope believes from L1,
@@ -2288,8 +2817,8 @@ COMMENT ON FUNCTION mempher.recall(text, text, vector, text, text, text[], int, 
 -- an encoding or an extraction.
 
 CREATE FUNCTION mempher.forget(p_scope text, p_episodes uuid[] DEFAULT NULL)
-    RETURNS TABLE (episodes int, encodings int, extractions int, facts int, jobs int,
-                   scope_removed boolean)
+    RETURNS TABLE (episodes int, encodings int, extractions int, facts int, entities int,
+                   jobs int, scope_removed boolean)
     LANGUAGE plpgsql
     SET search_path FROM CURRENT
     SET mempher.erasing = 'on'
@@ -2309,13 +2838,24 @@ BEGIN
         END IF;
     END IF;
 
+    -- An extraction applied while this runs must not resolve a name against an
+    -- entity that is on its way out.
+    PERFORM mempher._lock_l1(p_scope);
+
     -- Everything derived goes before what it was derived from. A fact is
     -- deleted rather than closed, because a closed window still says what it
     -- said; if what remains still supports the claim, the next extraction
     -- derives it again. The counts are the receipt.
+    --
+    -- A name is content too. Erasing a whole scope takes every entity; erasing
+    -- episodes takes the entities they introduced that no remaining fact is
+    -- about, and from the entities that stay, the other names those episodes
+    -- gave them.
     IF v_whole THEN
         DELETE FROM mempher.facts f WHERE f.scope_id = p_scope;
         GET DIAGNOSTICS facts = ROW_COUNT;
+        DELETE FROM mempher.entities n WHERE n.scope_id = p_scope;
+        GET DIAGNOSTICS entities = ROW_COUNT;
         DELETE FROM mempher.fact_extractions x WHERE x.scope_id = p_scope;
         GET DIAGNOSTICS extractions = ROW_COUNT;
         DELETE FROM mempher.episode_encodings c WHERE c.scope_id = p_scope;
@@ -2329,6 +2869,17 @@ BEGIN
     ELSE
         DELETE FROM mempher.facts f WHERE f.scope_id = p_scope AND f.episode_ids && p_episodes;
         GET DIAGNOSTICS facts = ROW_COUNT;
+        DELETE FROM mempher.entities n
+        WHERE n.scope_id = p_scope
+          AND EXISTS (SELECT 1 FROM mempher.entity_aliases a
+                      WHERE a.entity_id = n.id AND a.episode_ids && p_episodes)
+          AND NOT EXISTS (SELECT 1 FROM mempher.facts f
+                          WHERE f.scope_id = n.scope_id AND f.extractor = n.extractor
+                            AND f.subject = n.name);
+        GET DIAGNOSTICS entities = ROW_COUNT;
+        DELETE FROM mempher.entity_aliases a USING mempher.entities n
+        WHERE a.entity_id = n.id AND a.scope_id = p_scope AND a.episode_ids && p_episodes
+          AND a.key <> mempher._entity_key(n.name);
         DELETE FROM mempher.fact_extractions x WHERE x.scope_id = p_scope AND x.episode_id = ANY(p_episodes);
         GET DIAGNOSTICS extractions = ROW_COUNT;
         DELETE FROM mempher.episode_encodings c WHERE c.scope_id = p_scope AND c.episode_id = ANY(p_episodes);
@@ -2344,7 +2895,7 @@ END $$;
 
 COMMENT ON FUNCTION mempher.forget(text, uuid[]) IS
     'Erases a whole scope, or the named episodes of one (at most 1000), together with '
-    'every encoding, extraction marker, fact and job derived from them, in one '
+    'every encoding, extraction marker, fact, entity and job derived from them, in one '
     'transaction, and returns what went. Erasing what is not there removes nothing and '
     'is not an error. The only way rows leave mempher.episodes.';
 

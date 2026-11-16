@@ -172,7 +172,7 @@ func (r RecallRequest) Validate() error {
 // up in operator queries and log lines, so the same character rules apply.
 func (s Subject) Validate() error {
 	switch {
-	case len(s) == 0:
+	case blank(string(s)):
 		return fmt.Errorf("mempher: subject is empty: %w", ErrInvalidFact)
 	case len(s) > MaxSubjectLen:
 		return fmt.Errorf("mempher: subject is %d bytes, limit is %d: %w",
@@ -293,6 +293,9 @@ func (c ExtractCommand) Validate() error {
 	case len(c.Retract) > MaxRetractionsPerExtraction:
 		return fmt.Errorf("mempher: extraction retracts %d facts, limit is %d: %w",
 			len(c.Retract), MaxRetractionsPerExtraction, ErrInvalidExtraction)
+	case len(c.Alias) > MaxAliasesPerExtraction:
+		return fmt.Errorf("mempher: extraction declares %d aliases, limit is %d: %w",
+			len(c.Alias), MaxAliasesPerExtraction, ErrInvalidExtraction)
 	case c.At.IsZero():
 		return fmt.Errorf("mempher: extraction has no system time: %w", ErrInvalidExtraction)
 	}
@@ -310,6 +313,11 @@ func (c ExtractCommand) Validate() error {
 	for i, retraction := range c.Retract {
 		if err := retraction.Validate(); err != nil {
 			return fmt.Errorf("mempher: extraction retraction %d: %w", i, err)
+		}
+	}
+	for i, alias := range c.Alias {
+		if err := alias.Validate(); err != nil {
+			return fmt.Errorf("mempher: extraction alias %d: %w", i, err)
 		}
 	}
 	return nil

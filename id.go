@@ -123,6 +123,27 @@ func (id *FactID) UnmarshalText(text []byte) error {
 	return nil
 }
 
+// EntityID is an entity's surrogate key, a uuidv7 minted by the database.
+//
+// An entity is found by its names, which is how every query here addresses
+// one. The id is what stays the same as it gains them.
+type EntityID uuid.UUID
+
+// ParseEntityID parses the canonical textual form of an entity id.
+func ParseEntityID(s string) (EntityID, error) {
+	id, err := uuid.Parse(s)
+	if err != nil {
+		return EntityID{}, fmt.Errorf("mempher: parse entity id %q: %w", s, err)
+	}
+	return EntityID(id), nil
+}
+
+// String returns the canonical textual form of the id.
+func (id EntityID) String() string { return uuid.UUID(id).String() }
+
+// IsZero reports whether the id is unset.
+func (id EntityID) IsZero() bool { return id == EntityID{} }
+
 // ModelID identifies an embedding model precisely enough to re-embed against,
 // including any version that changes the vector space. Encodings are keyed by
 // it, so several models can coexist and a model change is a backfill.

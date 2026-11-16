@@ -216,6 +216,67 @@ func TestSupersessionKeepsThePastAnswerable(t *testing.T) {
 	}
 }
 
+// TestSupersessionReachesAcrossNames: once two names are known to be one
+// entity, news under one of them supersedes what was believed under the other.
+func TestSupersessionReachesAcrossNames(t *testing.T) {
+	t.Parallel()
+	sister := func(match string, subject mempher.Subject, city string, from time.Time) memphertest.Rule {
+		return memphertest.Rule{
+			Match:    match,
+			Replaces: true,
+			Assert: mempher.Assertion{
+				Subject: subject, Predicate: "lives_in", Object: city,
+				Statement:  "the user's sister lives in " + city,
+				Valid:      mempher.Validity{From: from},
+				Confidence: 0.9,
+			},
+		}
+	}
+	named := memphertest.Rule{
+		Match: "her name is anna",
+		Alias: []mempher.Alias{{Name: "Anna", Of: "the user's sister"}},
+		Assert: mempher.Assertion{
+			Subject: "the user's sister", Predicate: "first_name", Object: "Anna",
+			Statement:  "the user's sister is called Anna",
+			Valid:      mempher.Validity{From: before},
+			Confidence: 1,
+		},
+	}
+	f := newFactFixture(t,
+		sister("sister lives in paris", "the user's sister", "Paris", before),
+		named,
+		sister("anna moved to berlin", "Anna", "Berlin", moved),
+	)
+
+	for _, said := range []string{
+		"My sister lives in Paris", "Her name is Anna", "Anna moved to Berlin",
+	} {
+		f.append(t, "user:1", said)
+		f.drain(t)
+		f.clock.Advance(time.Hour)
+	}
+
+	got, err := f.memory.Recall(t.Context(), mempher.RecallRequest{
+		Scope: "user:1", Query: "where is Anna these days?", Subjects: []mempher.Subject{"anna"},
+	})
+	if err != nil {
+		t.Fatalf("Recall: %v", err)
+	}
+	var cities []string
+	for _, fact := range got.Facts {
+		if fact.Fact.Subject != "the user's sister" {
+			t.Errorf("fact %q is about %q, want every one under the entity's name",
+				fact.Fact.Statement, fact.Fact.Subject)
+		}
+		if fact.Fact.Predicate == "lives_in" {
+			cities = append(cities, fact.Fact.Object)
+		}
+	}
+	if len(cities) != 1 || cities[0] != "Berlin" {
+		t.Fatalf("Anna lives in %v, want only Berlin: %v", cities, statements(got))
+	}
+}
+
 // TestExtractionIsIdempotentAcrossDrains: a job that runs twice must leave the
 // same scope behind, because leasing is at-least-once.
 func TestExtractionIsIdempotentAcrossDrains(t *testing.T) {

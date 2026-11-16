@@ -4,6 +4,7 @@ package extract
 
 import (
 	"fmt"
+	"strconv"
 	"strings"
 	"time"
 
@@ -60,6 +61,25 @@ three values or the memory will hold it twice, so:
     must not both exist.
   - Put one thing in each object. Being allergic to two things is two
     assertions, not one object holding both.
+
+NAMES
+
+One person, place or thing is often called several things: "my sister" in one
+message and "Anna" in the next. You are shown the names already known, each with
+the other names it goes by.
+
+  - Write a subject under the name it is already known by. A fact about Anna,
+    when "the user's sister" is known and also called Anna, has the subject
+    "the user's sister".
+  - When the episodes show that two names are one thing, say so with an alias:
+    the new name, and the name it is another name for. "My sister Anna is
+    visiting" makes "Anna" an alias of "the user's sister". "I'm Alice" makes
+    "Alice" an alias of "the user".
+  - Declare an alias only when the text says so or leaves no doubt. Two people
+    who share a first name are not one person, and an alias cannot be undone.
+  - A known fact about any of a thing's names is a fact about that thing. If an
+    episode about Anna contradicts a known fact about the user's sister,
+    retract it.
 
 TIME
 
@@ -161,6 +181,28 @@ func renderKnown(b *strings.Builder, known []mempher.Fact) {
 			f.ID, f.Statement,
 			f.Subject, f.Predicate, f.Object,
 			f.Valid.From.Format(time.RFC3339), window, f.Confidence)
+	}
+}
+
+// renderEntities lists who the episodes name and what else each is called.
+// Entities with a single name are left out: a subject spelled the way it is
+// stored needs no explaining, and the list is read on every extraction.
+func renderEntities(b *strings.Builder, entities []mempher.Entity) {
+	b.WriteString("\nKNOWN NAMES\n\n")
+	listed := false
+	for _, e := range entities {
+		if len(e.Aliases) == 0 {
+			continue
+		}
+		names := make([]string, len(e.Aliases))
+		for i, alias := range e.Aliases {
+			names[i] = strconv.Quote(string(alias))
+		}
+		fmt.Fprintf(b, "%q is also called %s\n", e.Name, strings.Join(names, ", "))
+		listed = true
+	}
+	if !listed {
+		b.WriteString("Nothing here is known by more than one name yet.\n")
 	}
 }
 

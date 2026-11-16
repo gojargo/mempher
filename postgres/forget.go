@@ -33,15 +33,15 @@ func (s *Store) Forget(
 		episodes = episodeUUIDs(req.Episodes)
 	}
 	out := mempher.ForgetResult{Scope: req.Scope}
-	var counts [5]int32
+	var counts [6]int32
 	err := s.pool.QueryRow(ctx,
-		`SELECT episodes, encodings, extractions, facts, jobs, scope_removed FROM mempher.forget($1, $2)`,
+		`SELECT episodes, encodings, extractions, facts, jobs, scope_removed, entities FROM mempher.forget($1, $2)`,
 		string(req.Scope), episodes,
-	).Scan(&counts[0], &counts[1], &counts[2], &counts[3], &counts[4], &out.ScopeRemoved)
+	).Scan(&counts[0], &counts[1], &counts[2], &counts[3], &counts[4], &out.ScopeRemoved, &counts[5])
 	if err != nil {
 		return mempher.ForgetResult{}, apiError(fmt.Sprintf("forget in scope %q", req.Scope), err)
 	}
 	out.Episodes, out.Encodings, out.Extractions = int(counts[0]), int(counts[1]), int(counts[2])
-	out.Facts, out.Jobs = int(counts[3]), int(counts[4])
+	out.Facts, out.Jobs, out.Entities = int(counts[3]), int(counts[4]), int(counts[5])
 	return out, nil
 }

@@ -8,6 +8,7 @@ import (
 	"errors"
 	"fmt"
 	"log/slog"
+	"slices"
 	"strings"
 	"testing"
 	"time"
@@ -141,7 +142,7 @@ func TestNewRejectsUnusableConfig(t *testing.T) {
 func TestModelIdentifiesWhatProducedTheFacts(t *testing.T) {
 	base := newExtractor(t, newFake(), Options{})
 
-	if got := string(base.Model()); !strings.HasPrefix(got, "mempher-extract/v1+test-model+") {
+	if got := string(base.Model()); !strings.HasPrefix(got, "mempher-extract/v2+test-model+") {
 		t.Fatalf("Model = %q, want the prompt revision and the provider model in it", got)
 	}
 	if len(base.Model()) > mempher.MaxExtractorLen {
@@ -536,8 +537,8 @@ func TestPromptRevisionIsPinnedToTheTextItShips(t *testing.T) {
 	// revision then stay the old revision's until ops.Backfill re-derives them,
 	// which is the intended cost and the whole reason the revision is in the id.
 	const (
-		pinnedRevision = 1
-		pinnedDigest   = "ea4099386a43a723"
+		pinnedRevision = 2
+		pinnedDigest   = "a493b370573ceac7"
 	)
 
 	schema, err := extractionSchema(Options{MaxAssertions: DefaultMaxAssertions})
@@ -621,5 +622,51 @@ func TestReconcileRejectsAWrongShapedTopicsReply(t *testing.T) {
 	_, err := e.Extract(t.Context(), request(parisFact()))
 	if !errors.Is(err, ErrMalformedResponse) {
 		t.Fatalf("Extract: got %v, want ErrMalformedResponse", err)
+	}
+}
+
+func TestExtractReadsAliasesAndShowsTheKnownNames(t *testing.T) {
+	c := newFake(`{
+		"assertions": [],
+		"retractions": [],
+		"aliases": [
+			{"alias": " Anna ", "of": "the user's sister"},
+			{"alias": "the user", "of": "The User"},
+			{"alias": "", "of": "the user"}
+		]
+	}`)
+	e := newExtractor(t, c, Options{})
+
+	req := request()
+	req.Entities = []mempher.Entity{
+		{Name: "the user", Aliases: []mempher.Subject{"Alice"}},
+		{Name: "Bob"},
+	}
+	res, err := e.Extract(t.Context(), req)
+	if err != nil {
+		t.Fatalf("Extract: %v", err)
+	}
+	want := []mempher.Alias{{Name: "Anna", Of: "the user's sister"}}
+	if !slices.Equal(res.Alias, want) {
+		t.Errorf("aliases = %+v, want %+v: a name for itself and an empty name are dropped", res.Alias, want)
+	}
+
+	user := c.prompts[0].User
+	if !strings.Contains(user, `"the user" is also called "Alice"`) {
+		t.Errorf("the prompt does not say what the user is also called:\n%s", user)
+	}
+	if strings.Contains(user, `"Bob"`) {
+		t.Errorf("the prompt lists an entity with one name:\n%s", user)
+	}
+}
+
+func TestAReplyWithoutAliasesIsStillAnAnswer(t *testing.T) {
+	e := newExtractor(t, newFake(`{"assertions": [], "retractions": []}`), Options{})
+	res, err := e.Extract(t.Context(), request())
+	if err != nil {
+		t.Fatalf("Extract: %v", err)
+	}
+	if len(res.Alias) != 0 {
+		t.Errorf("aliases = %+v, want none", res.Alias)
 	}
 }

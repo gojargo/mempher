@@ -23,8 +23,13 @@ type Rule struct {
 	// matching episode's OccurredAt, which is what an extractor with no better
 	// information should do.
 	Assert mempher.Assertion
+	// Alias are names to declare one entity whenever the rule fires, as a
+	// model does on reading "my sister Anna".
+	Alias []mempher.Alias
 	// Replaces retracts any known fact with this rule's subject and predicate
-	// but a different object, as of the matching episode's OccurredAt.
+	// but a different object, as of the matching episode's OccurredAt. The
+	// subject is matched through [mempher.ExtractRequest.Entities], so a rule
+	// about "Anna" replaces a fact about whoever Anna is another name for.
 	//
 	// It is how a test exercises the case the whole temporal design exists
 	// for: the world changed, the old claim was true and stays answerable, and
@@ -130,6 +135,7 @@ func (e *Extractor) Extract(
 				assertion.Valid.From = episode.OccurredAt
 			}
 			out.Assert = append(out.Assert, assertion)
+			out.Alias = append(out.Alias, rule.Alias...)
 
 			if !rule.Replaces {
 				continue
@@ -137,8 +143,9 @@ func (e *Extractor) Extract(
 			// Only a different object is a contradiction. The same claim
 			// asserted again is a re-assertion, and retracting it here would
 			// close the very window the assertion above is about to open.
+			subject := nameOf(req.Entities, assertion.Subject)
 			for _, known := range req.Known {
-				if known.Subject != assertion.Subject ||
+				if known.Subject != subject ||
 					known.Predicate != assertion.Predicate ||
 					known.Object == assertion.Object {
 					continue
@@ -155,6 +162,20 @@ func (e *Extractor) Extract(
 		}
 	}
 	return out, nil
+}
+
+// nameOf returns the name facts about subject are stored under: the entity's
+// own, when subject is one of an entity's other names. It is what a model does
+// with the known names it is shown.
+func nameOf(entities []mempher.Entity, subject mempher.Subject) mempher.Subject {
+	for _, entity := range entities {
+		for _, alias := range entity.Aliases {
+			if strings.EqualFold(string(alias), string(subject)) {
+				return entity.Name
+			}
+		}
+	}
+	return subject
 }
 
 var _ mempher.Extractor = (*Extractor)(nil)

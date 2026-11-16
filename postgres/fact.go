@@ -49,6 +49,12 @@ type assertionJSON struct {
 	Confidence float32           `json:"confidence"`
 }
 
+// aliasJSON is one element of mempher.apply_extraction's aliases argument.
+type aliasJSON struct {
+	Alias mempher.Subject `json:"alias"`
+	Of    mempher.Subject `json:"of"`
+}
+
 // retractionJSON is one element of mempher.apply_extraction's retract argument.
 type retractionJSON struct {
 	Fact uuid.UUID `json:"fact"`
@@ -93,10 +99,19 @@ func (s *Store) ApplyExtraction(
 	if err != nil {
 		return nil, fmt.Errorf("mempher/postgres: apply extraction: encode retractions: %w", err)
 	}
+	aliases := make([]aliasJSON, len(cmd.Alias))
+	for i, a := range cmd.Alias {
+		aliases[i] = aliasJSON{Alias: a.Name, Of: a.Of}
+	}
+	aliasPayload, err := json.Marshal(aliases)
+	if err != nil {
+		return nil, fmt.Errorf("mempher/postgres: apply extraction: encode aliases: %w", err)
+	}
 	facts, err := scanFacts(ctx, s.pool,
-		`SELECT `+factColumns+` FROM mempher.apply_extraction($1, $2, $3, $4::jsonb, $5::jsonb, $6)`,
+		`SELECT `+factColumns+` FROM mempher.apply_extraction(
+			$1, $2, $3, $4::jsonb, $5::jsonb, $6, p_aliases := $7::jsonb)`,
 		string(cmd.Scope), string(cmd.Extractor), episodeUUIDs(cmd.Episodes),
-		assertPayload, retractPayload, cmd.At)
+		assertPayload, retractPayload, cmd.At, aliasPayload)
 	if err != nil {
 		return nil, s.wrapFactError("apply extraction", cmd.Scope, err)
 	}
@@ -269,6 +284,17 @@ func scanFact(rows pgx.Rows) (mempher.Fact, error) {
 		return mempher.Fact{}, fmt.Errorf("scan fact: %w", err)
 	}
 
+	return buildFact(f, id, subject, predicate, valid, episodes)
+}
+
+// buildFact finishes a fact from the columns a scan cannot place directly.
+func buildFact(
+	f mempher.Fact,
+	id [16]byte,
+	subject, predicate string,
+	valid pgtype.Range[pgtype.Timestamptz],
+	episodes []uuid.UUID,
+) (mempher.Fact, error) {
 	f.ID = mempher.FactID(id)
 	f.Subject = mempher.Subject(subject)
 	f.Predicate = mempher.Predicate(predicate)

@@ -113,10 +113,28 @@ func extractionSchema(opts Options) (json.RawMessage, error) {
 		},
 	}
 
+	name := func(description string) *jsonSchema {
+		return &jsonSchema{
+			Type:        "string",
+			MaxLength:   ptr(mempher.MaxSubjectLen),
+			Description: description,
+		}
+	}
+	alias := &jsonSchema{
+		Type:                 "object",
+		AdditionalProperties: ptr(false),
+		Required:             []string{"alias", "of"},
+		Properties: map[string]*jsonSchema{
+			"alias": name("The additional name, as the episodes write it."),
+			"of": name("The name it is another name for: one already known, or the " +
+				"subject you are using for it in this answer."),
+		},
+	}
+
 	root := &jsonSchema{
 		Type:                 "object",
 		AdditionalProperties: ptr(false),
-		Required:             []string{"assertions", "retractions"},
+		Required:             []string{"assertions", "retractions", "aliases"},
 		Properties: map[string]*jsonSchema{
 			"assertions": {
 				Type:        "array",
@@ -130,6 +148,13 @@ func extractionSchema(opts Options) (json.RawMessage, error) {
 				MaxItems: ptr(mempher.MaxRetractionsPerExtraction),
 				Description: "Known facts these episodes contradict. An empty array is a " +
 					"good, common answer.",
+			},
+			"aliases": {
+				Type:     "array",
+				Items:    alias,
+				MaxItems: ptr(mempher.MaxAliasesPerExtraction),
+				Description: "Names these episodes show to be one thing. An empty array " +
+					"is a good, common answer.",
 			},
 		},
 	}

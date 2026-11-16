@@ -25,7 +25,7 @@ const (
 	// deployment's existing facts the previous revision's facts until a
 	// backfill re-derives them. It therefore moves on a minor version and is
 	// called out in the changelog, never on a patch.
-	PromptVersion = 1
+	PromptVersion = 2
 
 	// DefaultMaxAssertions is how many claims one extraction may assert when
 	// [Options.MaxAssertions] does not say.
@@ -269,7 +269,7 @@ func New(c Completer, opts Options) (*Extractor, error) {
 // Model returns the extractor id: this package's prompt revision, the provider
 // model, and a digest of [Options].
 //
-//	mempher-extract/v1+claude-opus-5+a3f9c1e2
+//	mempher-extract/v2+claude-opus-5+a3f9c1e2
 //
 // All three belong in it. Facts are keyed by extractor precisely so that two
 // extractors' opinions never merge into one scope, and changing the
@@ -325,6 +325,7 @@ func (e *Extractor) extract(
 	var user strings.Builder
 	renderNow(&user, req.Now)
 	renderKnown(&user, known)
+	renderEntities(&user, req.Entities)
 	renderEpisodes(&user, req.Episodes)
 
 	raw, err := e.completer.Complete(ctx, Prompt{
@@ -397,7 +398,16 @@ func (e *Extractor) narrow(
 		return req.Known, nil
 	}
 
+	// A subject named by one of an entity's other names is that entity, and
+	// the known facts carry its own.
 	subjects := lowerSet(named)
+	for _, entity := range req.Entities {
+		for _, alias := range entity.Aliases {
+			if _, ok := subjects[strings.ToLower(string(alias))]; ok {
+				subjects[strings.ToLower(string(entity.Name))] = struct{}{}
+			}
+		}
+	}
 	predicates := lowerSet(related)
 	kept := make([]mempher.Fact, 0, len(req.Known))
 	for _, f := range req.Known {

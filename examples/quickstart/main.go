@@ -134,8 +134,8 @@ func main() {
 	if err != nil {
 		log.Fatalf("forget: %v", err)
 	}
-	fmt.Printf("erased: %d episodes, %d encodings, %d facts, %d jobs (scope removed: %t)\n",
-		erased.Episodes, erased.Encodings, erased.Facts, erased.Jobs, erased.ScopeRemoved)
+	fmt.Printf("erased: %d episodes, %d encodings, %d facts, %d entities, %d jobs (scope removed: %t)\n",
+		erased.Episodes, erased.Encodings, erased.Facts, erased.Entities, erased.Jobs, erased.ScopeRemoved)
 }
 
 // say appends one episode at a given event time.

@@ -186,6 +186,11 @@ type ExtractRequest struct {
 	// extractor can recognise a re-assertion and can retract what the new
 	// episodes contradict. It may be empty, and is capped by the caller.
 	Known []Fact
+	// Entities are the entities the new episodes name, each with every name
+	// it goes by. They are what lets an extractor see that an episode about
+	// "Anna" bears on a known fact about "the user's sister". It may be
+	// empty.
+	Entities []Entity
 	// Now is the current instant, from the [Clock]. It is what resolves the
 	// relative dates that natural language is made of: "since last Tuesday"
 	// has no meaning without it, and reading a wall clock inside the
@@ -204,6 +209,8 @@ type ExtractResult struct {
 	// Retract are the facts the episodes contradict, named from
 	// [ExtractRequest.Known].
 	Retract []Retraction
+	// Alias are the names the episodes show to be one entity.
+	Alias []Alias
 }
 
 // Extractor turns episodes into facts. It is the second model-calling port after
@@ -251,6 +258,10 @@ type ExtractCommand struct {
 	// Retract are the windows to close, at most
 	// [MaxRetractionsPerExtraction].
 	Retract []Retraction
+	// Alias are the names to join, at most [MaxAliasesPerExtraction]. They
+	// are applied in order, after the retractions and before the assertions,
+	// so an assertion is written under whatever name they leave standing.
+	Alias []Alias
 	// At is system time for the write, from the [Clock]. A [FactStore] never
 	// reads a clock, which is what makes an extraction replayable.
 	At time.Time
@@ -276,7 +287,8 @@ type FactQuery struct {
 	// asks "what was true then", and is off by default because the usual
 	// question is "what is true now".
 	IncludeClosed bool
-	// Subjects, when non-empty, keeps only facts about one of them.
+	// Subjects, when non-empty, keeps only facts about one of them. Any name
+	// an [Entity] goes by selects its facts.
 	Subjects []Subject
 	// Predicates, when non-empty, keeps only facts asserting one of them.
 	Predicates []Predicate
@@ -284,9 +296,10 @@ type FactQuery struct {
 	// Zero keeps everything.
 	MinConfidence float32
 	// Text, when non-empty, orders results by full-text relevance to it
-	// rather than by subject and predicate. It decides which facts survive
-	// Limit when a scope holds more than fit; it never excludes a fact that
-	// the filters above admitted.
+	// rather than by subject and predicate, and puts first the facts that
+	// touch an [Entity] it names. It decides which facts survive Limit when
+	// a scope holds more than fit; it never excludes a fact that the filters
+	// above admitted.
 	Text string
 	// Vector, when set, orders results by how near each statement's
 	// embedding is to it, fused with Text's ordering when both are given.
@@ -320,7 +333,8 @@ type FactStore interface {
 	// It is idempotent, because leasing is at-least-once. Re-asserting an
 	// identical claim over an identical window refreshes it in place rather
 	// than duplicating it, and re-closing an already-closed window at the
-	// same instant does nothing. It returns the facts as persisted.
+	// same instant does nothing. It returns the facts as persisted, each
+	// under its [Entity]'s name, which is not always the subject asserted.
 	ApplyExtraction(ctx context.Context, cmd ExtractCommand) ([]Fact, error)
 
 	// Facts returns the facts matching q, ordered by subject and predicate,
@@ -329,6 +343,18 @@ type FactStore interface {
 
 	// Fact returns one fact by id within a scope, or [ErrNotFound].
 	Fact(ctx context.Context, scope ScopeID, id FactID) (Fact, error)
+
+	// Entities lists the entities matching q, by name.
+	Entities(ctx context.Context, q EntityQuery) ([]Entity, error)
+
+	// MergeEntities applies one [Alias] outside an extraction and returns
+	// the entity both names now lead to. Applying it twice changes nothing
+	// the second time. A scope that does not exist is [ErrNotFound].
+	MergeEntities(ctx context.Context, cmd MergeCommand) (Entity, error)
+
+	// RelatedFacts returns the facts within q.Hops of the entities q names,
+	// nearest first.
+	RelatedFacts(ctx context.Context, q RelatedQuery) ([]RelatedFact, error)
 
 	// PendingFactEncodings returns facts with no encoding for a model, in id
 	// order, with the statement to embed.

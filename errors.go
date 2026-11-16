@@ -56,6 +56,10 @@ var (
 	// contradicts. It is reported rather than resolved: silently widening one
 	// of the two windows would lose the disagreement that caused it.
 	ErrFactConflict = errors.New("fact validity windows conflict")
+	// ErrInvalidEntity means a name an entity was to go by -- in an [Alias],
+	// a [MergeCommand] or a [RelatedQuery] -- was empty, too long or held a
+	// control character.
+	ErrInvalidEntity = errors.New("invalid entity name")
 	// ErrAllChannelsFailed means every retrieval channel failed, so the result
 	// would be silently empty rather than merely degraded. Lesser failures are
 	// reported in [Recollection.Channels].
