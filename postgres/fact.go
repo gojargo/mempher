@@ -175,58 +175,13 @@ func (s *Store) Fact(
 	return facts[0], nil
 }
 
-// pendingExtractionsSQL finds episodes no extraction marker covers. Like the
-// encoding anti-join it runs against L0 and one projection table, which is what
-// lets a lost job, or a change of extractor, be recovered by enqueueing what it
-// returns.
-const (
-	pendingExtractAllScopesSQL = `
-SELECT e.id
-FROM mempher.episodes e
-WHERE NOT EXISTS (
-    SELECT 1 FROM mempher.fact_extractions x
-    WHERE x.episode_id = e.id AND x.extractor = $1
-)
-ORDER BY e.scope_id, e.seq
-LIMIT $2`
-
-	pendingExtractOneScopeSQL = `
-SELECT e.id
-FROM mempher.episodes e
-WHERE e.scope_id = $1
-  AND e.seq > $2
-  AND NOT EXISTS (
-    SELECT 1 FROM mempher.fact_extractions x
-    WHERE x.episode_id = e.id AND x.extractor = $3
-)
-ORDER BY e.seq
-LIMIT $4`
-)
-
 // PendingExtractions returns ids of episodes no extraction marker covers, in Seq
 // order.
 func (s *Store) PendingExtractions(
 	ctx context.Context,
 	q ops.PendingExtractions,
 ) ([]mempher.EpisodeID, error) {
-	if q.Extractor == "" {
-		return nil, fmt.Errorf("mempher/postgres: pending extractions: extractor is empty: %w",
-			mempher.ErrInvalidConfig)
-	}
-	if q.Scope != "" {
-		if err := q.Scope.Validate(); err != nil {
-			return nil, fmt.Errorf("mempher/postgres: pending extractions: %w", err)
-		}
-	}
-	switch {
-	case q.AfterSeq < 0:
-		return nil, fmt.Errorf("mempher/postgres: pending extractions: AfterSeq is %d: %w",
-			q.AfterSeq, mempher.ErrInvalidConfig)
-	case q.AfterSeq > 0 && q.Scope == "":
-		return nil, fmt.Errorf(
-			"mempher/postgres: pending extractions: AfterSeq needs a Scope, because seq is "+
-				"only ordered within one: %w", mempher.ErrInvalidConfig)
-	case q.Limit < 0:
+	if q.Limit < 0 {
 		return nil, fmt.Errorf("mempher/postgres: pending extractions: Limit is %d: %w",
 			q.Limit, mempher.ErrInvalidConfig)
 	}
@@ -234,19 +189,18 @@ func (s *Store) PendingExtractions(
 	if limit == 0 {
 		limit = DefaultPendingExtractionsLimit
 	}
-
-	sql, args := pendingExtractAllScopesSQL, []any{string(q.Extractor), limit}
+	var scope *string
 	if q.Scope != "" {
-		sql = pendingExtractOneScopeSQL
-		args = []any{string(q.Scope), q.AfterSeq, string(q.Extractor), limit}
+		name := string(q.Scope)
+		scope = &name
 	}
-
-	rows, err := s.pool.Query(ctx, sql, args...)
+	rows, err := s.pool.Query(ctx,
+		`SELECT id FROM mempher.pending_episodes('extract', $1, $2, $3, $4)`,
+		string(q.Extractor), scope, q.AfterSeq, int32(limit))
 	if err != nil {
-		return nil, s.wrapFactError("pending extractions", q.Scope, err)
+		return nil, apiError("pending extractions", err)
 	}
 	defer rows.Close()
-
 	out := make([]mempher.EpisodeID, 0, min(limit, 128))
 	for rows.Next() {
 		var id uuid.UUID
@@ -256,7 +210,7 @@ func (s *Store) PendingExtractions(
 		out = append(out, mempher.EpisodeID(id))
 	}
 	if err := rows.Err(); err != nil {
-		return nil, s.wrapFactError("pending extractions", q.Scope, err)
+		return nil, apiError("pending extractions", err)
 	}
 	return out, nil
 }

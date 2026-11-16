@@ -539,3 +539,63 @@ func TestSQLRecall(t *testing.T) {
 		wantSQLState(t, exec(t, pool, `SELECT mempher.recall('r', 'x', p_occurred_from := '2026-02-01', p_occurred_to := '2026-01-01')`), "MP013")
 	})
 }
+
+func TestSQLForget(t *testing.T) {
+	t.Parallel()
+	_, pool := migrated(t)
+	ctx := t.Context()
+
+	for _, scope := range []string{"f1", "f2"} {
+		if err := exec(t, pool, `SELECT mempher.append($1, '[
+			{"content":"a","role":"user","source":"s"},{"content":"b","role":"user","source":"s"}]')`, scope); err != nil {
+			t.Fatalf("append: %v", err)
+		}
+	}
+
+	t.Run("the erasure declaration does not outlive the call", func(t *testing.T) {
+		tx, err := pool.Begin(ctx)
+		if err != nil {
+			t.Fatalf("begin: %v", err)
+		}
+		defer func() { _ = tx.Rollback(ctx) }()
+		if _, err := tx.Exec(ctx, `SELECT mempher.forget('f1', ARRAY[(SELECT id FROM mempher.episodes WHERE scope_id = 'f1' AND seq = 1)])`); err != nil {
+			t.Fatalf("forget: %v", err)
+		}
+		_, err = tx.Exec(ctx, `DELETE FROM mempher.episodes WHERE scope_id = 'f2'`)
+		var pgErr *pgconn.PgError
+		if !errors.As(err, &pgErr) || pgErr.Code != "P0001" {
+			t.Fatalf("a bare DELETE after forget in the same transaction: err = %v, want the append-only trigger", err)
+		}
+	})
+
+	t.Run("pending_episodes lists what L0 still owes", func(t *testing.T) {
+		var pending int
+		if err := pool.QueryRow(ctx, `SELECT count(*) FROM mempher.pending_episodes('encode', 'm')`).Scan(&pending); err != nil {
+			t.Fatalf("pending_episodes: %v", err)
+		}
+		if pending != 4 {
+			t.Errorf("%d pending, want all 4 episodes", pending)
+		}
+		wantSQLState(t, exec(t, pool, `SELECT * FROM mempher.pending_episodes('encode', 'm', NULL, 3)`), "MP013")
+	})
+
+	t.Run("a whole scope goes, with its row, and says so", func(t *testing.T) {
+		var episodes, jobs int
+		var removed bool
+		err := pool.QueryRow(ctx, `SELECT episodes, jobs, scope_removed FROM mempher.forget('f2')`).
+			Scan(&episodes, &jobs, &removed)
+		if err != nil {
+			t.Fatalf("forget: %v", err)
+		}
+		if episodes != 2 || jobs != 1 || !removed {
+			t.Errorf("erased %d episodes and %d jobs, scope removed %v; want 2, 1, true", episodes, jobs, removed)
+		}
+		var again bool
+		if err := pool.QueryRow(ctx, `SELECT scope_removed FROM mempher.forget('f2')`).Scan(&again); err != nil {
+			t.Fatalf("forget again: %v", err)
+		}
+		if again {
+			t.Error("forgetting an absent scope reported removing it")
+		}
+	})
+}
